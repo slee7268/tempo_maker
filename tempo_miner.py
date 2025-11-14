@@ -442,9 +442,80 @@ def build_tree_all_checks(start_board, eng, args):
     
     return ((tree, principal_san, principal_uci, fastest_mate), True)
 
+# -------------------- Difficulty Rating --------------------
+def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_len):
+    """
+    Calculate puzzle difficulty rating (800-2500 range) based on multiple factors:
+    1. Mate-in distance (longer = harder)
+    2. Number of alternative moves to consider (branching factor)
+    3. Presence of drops in solution
+    4. Average player rating from game
+    5. Solution length complexity
+    """
+    base_rating = 1200  # Starting point
+    
+    # Factor 1: Mate-in distance (each ply adds difficulty)
+    # Mate in 3 plies = +0, Mate in 9 plies = +300
+    mate_factor = min((mate_in - 3) * 50, 400)
+    
+    # Factor 2: Tree complexity (branching factor)
+    # Count total attacker moves across all nodes
+    total_moves = 0
+    forcing_moves = 0
+    if tree:
+        for fen_key, node_data in tree.items():
+            attacker_moves = node_data.get("attacker", [])
+            total_moves += len(attacker_moves)
+            forcing_moves += sum(1 for m in attacker_moves if m.get("class") == "force")
+    
+    # More alternatives = harder puzzle
+    complexity_factor = min(total_moves * 10, 300)
+    
+    # High ratio of forcing moves = slightly easier (clearer path)
+    if total_moves > 0:
+        forcing_ratio = forcing_moves / total_moves
+        clarity_penalty = int((1.0 - forcing_ratio) * 100)  # Less forcing = harder
+    else:
+        clarity_penalty = 0
+    
+    # Factor 3: Drops in solution (Crazyhouse-specific complexity)
+    drop_count = sum(1 for move in (solution_len or []) if '@' in str(move))
+    drop_factor = drop_count * 40
+    
+    # Factor 4: Average player ELO (higher rated games = potentially harder positions)
+    try:
+        white_elo = int(game.headers.get("WhiteElo", "0"))
+        black_elo = int(game.headers.get("BlackElo", "0"))
+        if white_elo > 0 and black_elo > 0:
+            avg_elo = (white_elo + black_elo) / 2
+            # Use player ELO as a baseline adjustment (±200 range)
+            elo_adjustment = int((avg_elo - 1500) * 0.2)
+            elo_adjustment = max(-200, min(200, elo_adjustment))
+        else:
+            elo_adjustment = 0
+    except:
+        elo_adjustment = 0
+    
+    # Factor 5: Solution length
+    solution_length_factor = min(solution_len * 15, 150)
+    
+    # Combine all factors
+    difficulty = base_rating + mate_factor + complexity_factor + clarity_penalty + drop_factor + elo_adjustment + solution_length_factor
+    
+    # Clamp to reasonable range
+    difficulty = max(800, min(2500, difficulty))
+    
+    return int(difficulty)
+
 # -------------------- Miner --------------------
 def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, tree=None):
     w_poc, b_poc = pockets_to_maps(start_board)
+    
+    # Calculate difficulty rating
+    difficulty_rating = calculate_difficulty_rating(
+        mate_in, tree, start_board, game, len(solutionSAN) if solutionSAN else 0
+    )
+    
     rec = {
         "id": pid,
         "variant": "crazyhouse",
@@ -453,6 +524,7 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
         "mateIn": int(mate_in),
         "solutionSAN": solutionSAN[:],
         "solutionUCI": solutionUCI[:] if solutionUCI else None,
+        "difficultyRating": difficulty_rating,
         "whitePocket": w_poc, "blackPocket": b_poc,
         "tags": ["alwaysCheck","dropOK","fromGame","forced","fullChecks"],
         "whiteElo": game.headers.get("WhiteElo"),
@@ -477,7 +549,7 @@ def main():
     fh = open_text_stream(args.in_path)
     out_f = open(args.out_jsonl, "w", encoding="utf-8")
     prev_f = open(args.out_preview, "w", encoding="utf-8", newline="")
-    pw = csv.DictWriter(prev_f, fieldnames=["id","mateIn","sideToMove","fenStart"])
+    pw = csv.DictWriter(prev_f, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
     pw.writeheader()
 
     reservoir, accepted, games_seen = [], 0, 0
@@ -534,18 +606,20 @@ def main():
                                 with open(args.out_jsonl,"w",encoding="utf-8") as f:
                                     for r in reservoir: f.write(json.dumps(r)+"\n")
                                 with open(args.out_preview,"w",encoding="utf-8",newline="") as ph:
-                                    pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart"])
+                                    pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
                                     pw2.writeheader()
                                     for r in reservoir:
                                         pw2.writerow({"id":r["id"],"mateIn":r["mateIn"],
-                                                      "sideToMove":r["sideToMove"],"fenStart":r["fenStart"]})
+                                                      "sideToMove":r["sideToMove"],"fenStart":r["fenStart"],
+                                                      "difficultyRating":r["difficultyRating"]})
                                 print(f"Done. Games read: {games_seen:,} | Puzzles found: {accepted:,}", file=sys.stderr)
                                 print(f"[tempo] games={games_seen:,} accepted={accepted:,} out={len(reservoir):,}", file=sys.stderr)
                                 sys.exit(0)
                     else:
                         out_f.write(json.dumps(rec) + "\n")
                         pw.writerow({"id": rec["id"], "mateIn": rec["mateIn"],
-                                     "sideToMove": rec["sideToMove"], "fenStart": rec["fenStart"]})
+                                     "sideToMove": rec["sideToMove"], "fenStart": rec["fenStart"],
+                                     "difficultyRating": rec["difficultyRating"]})
                     break  # at most one puzzle per game for speed
 
                 if args.max_games and games_seen >= args.max_games:
@@ -560,11 +634,12 @@ def main():
         with open(args.out_jsonl, "w", encoding="utf-8") as f:
             for r in reservoir: f.write(json.dumps(r) + "\n")
         with open(args.out_preview, "w", encoding="utf-8", newline="") as ph:
-            pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart"])
+            pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
             pw2.writeheader()
             for r in reservoir:
                 pw2.writerow({"id":r["id"],"mateIn":r["mateIn"],
-                              "sideToMove":r["sideToMove"],"fenStart":r["fenStart"]})
+                              "sideToMove":r["sideToMove"],"fenStart":r["fenStart"],
+                              "difficultyRating":r["difficultyRating"]})
 
     print(f"Done. Games read: {games_seen:,} | Puzzles found: {accepted:,}", file=sys.stderr)
     out_count = len(reservoir) if (args.sample>0) else accepted

@@ -1,0 +1,78 @@
+{
+  "id": "zh:example123:ply28",
+  "variant": "crazyhouse",
+  "fenStart": "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[P] w KQkq - 0 1",
+  "sideToMove": "w",
+  "mateIn": 5,
+  "solutionSAN": ["Bxf7+", "Kxf7", "Ng5+", "Ke7", "Qh5", "Nf6", "Qf7#"],
+  "solutionUCI": ["c4f7", "e8f7", "f3g5", "f7e7", "d1h5", "f6f6", "h5f7"],
+  "difficultyRating": 1450,
+  "whitePocket": {
+    "P": 1,
+    "N": 0,
+    "B": 0,
+    "R": 0,
+    "Q": 0
+  },
+  "blackPocket": {
+    "P": 0,
+    "N": 0,
+    "B": 0,
+    "R": 0,
+    "Q": 0
+  },
+  "tags": ["alwaysCheck", "dropOK", "fromGame", "forced", "fullChecks"],
+  "whiteElo": "1654",
+  "blackElo": "1612",
+  "result": "1-0",
+  "site": "https://lichess.org/example123",
+  "date": "2025.09.15",
+  "tree": {
+    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[P] w KQkq - 0 1": {
+      "attacker": [
+        {
+          "uci": "c4f7",
+          "class": "force",
+          "defense": {
+            "uci": "e8f7"
+          },
+          "nextFen": "r1bq3r/ppppkppp/2n2n2/2b1p3/4P3/5N2/PPPP1PPP/RNBQK2R[BP] b KQ - 0 1"
+        }
+      ]
+    },
+    "r1bq3r/ppppkppp/2n2n2/2b1p3/4P3/5N2/PPPP1PPP/RNBQK2R[BP] b KQ - 0 1": {
+      "attacker": [
+        {
+          "uci": "f3g5",
+          "class": "force",
+          "defense": {
+            "uci": "f7e7"
+          },
+          "nextFen": "r1bq3r/ppppkppp/2n2n2/2b1p1N1/4P3/8/PPPP1PPP/RNBQK2R[BP] w KQ - 0 2"
+        }
+      ]
+    },
+    "r1bq3r/ppppkppp/2n2n2/2b1p1N1/4P3/8/PPPP1PPP/RNBQK2R[BP] w KQ - 0 2": {
+      "attacker": [
+        {
+          "uci": "d1h5",
+          "class": "force",
+          "defense": {
+            "uci": "f6f6"
+          },
+          "nextFen": "r1bq3r/ppppkppp/2n2N2/2b1p2Q/4P3/8/PPPP1PPP/RNB1K2R[BP] b KQ - 0 2"
+        }
+      ]
+    },
+    "r1bq3r/ppppkppp/2n2N2/2b1p2Q/4P3/8/PPPP1PPP/RNB1K2R[BP] b KQ - 0 2": {
+      "attacker": [
+        {
+          "uci": "h5f7",
+          "class": "mate",
+          "defense": null,
+          "nextFen": null
+        }
+      ]
+    }
+  }
+}
