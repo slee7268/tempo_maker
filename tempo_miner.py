@@ -249,7 +249,7 @@ def pockets_to_maps(board: chess.Board) -> Tuple[Dict[str, int], Dict[str, int]]
     for color, target in ((chess.WHITE, w_map), (chess.BLACK, b_map)):
         pocket = board.pockets[color]
         for piece_type in range(1, 7):
-            cnt = pocket.get(piece_type, 0)
+            cnt = pocket.count(piece_type)
             if cnt > 0:
                 piece_symbol = chess.Piece(piece_type, color).symbol()
                 # We want 'P', 'N', etc. uppercased for consistency

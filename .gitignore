@@ -41,3 +41,5 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+lichess_db_crazyhouse_rated_2025-09.pgn
