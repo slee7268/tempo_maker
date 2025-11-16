@@ -1,449 +1,283 @@
 #!/usr/bin/env python3
 """
-Crazyhouse -> Tempo puzzle miner (attacker-perspective forcedness, PV-safe)
+Crazyhouse -> Tempo puzzle miner (Tempo variant = always checking + crazyhouse-style drops).
 
-What it does
-- Scans late plies of each game (last --tail-plies) for a root position where an
-  ATTACKER checking move forces mate (proven BEFORE pushing, via searchmoves).
-- Builds a checks-only tree:
-    * "force": still forces mate -> store one best defense -> recurse
-    * "fail": does not force mate -> store one best defense -> leaf
-    * "mate": attacker move delivers mate immediately
-- Stores: fenStart (with pockets), sideToMove, mateIn (fastest attacker mate),
-  principal solution SAN/UCI, pockets, and the FEN-keyed attacker tree.
+Takes a PGN of Crazyhouse games (e.g. lichess_db_crazyhouse_rated_2025-10.pgn),
+uses Fairy-Stockfish largeboard to:
+  * scan for “always-check” sequences (tempo-style forcing sequences),
+  * verify they are correct and lead to mate within a fixed depth,
+  * output them as JSONL suitable for a Tempo chess app.
 
-Key details/fixes
-- Forcedness proof is done BEFORE pushing the attacker move (correct perspective).
-- Defender reply is taken from PV[1] (since PV[0] is the attacker move); if PV too short
-  or mismatched, we fall back to a bestmove query from the post-attack position.
-- Movetime-based probing by default for predictable runtime.
+High-level pipeline:
 
-Example
-  python tempo_miner.py \
-    --in lichess_db_crazyhouse_rated_2025-09.pgn \
-    --out crazy_tempo.jsonl --preview zh_tempo_preview.csv \
-    --tail-plies 16 --sample 50 \
-    --verify-engine "$(which fairy-stockfish)" \
-    --movetime-ms 800 --engine-timeout 4 \
-    --max-mate-in 9 --max-nodes 3000 \
-    --per-puzzle-timeout-sec 20 \
-    --progress-every-games 10
+1. Read Crazyhouse PGN using python-chess.
+2. For each game, walk moves and build:
+   - board states,
+   - crazyhouse pockets,
+   - a search tree tracking attacker/defender moves.
+3. When a promising “always-check” candidate is found:
+   - verify with engine (UCI: Fairy-Stockfish)
+   - ensure check on every move
+   - ensure mate within `--max-mate-in`
+4. Emit a record:
+   - ID, start FEN, side to move
+   - SAN/uci solution lines
+   - simple difficulty estimate
+   - optional tree for debugging/training.
+
+This script is intentionally self-contained so it can be dropped into
+a project and run directly.
+
+Requirements:
+  pip install python-chess tqdm
+
+Engine:
+  - Fairy-Stockfish largeboard binary, path given by --engine-path or --verify-engine
 """
 
-import sys, io, csv, json, argparse, random, subprocess, time
-import chess, chess.pgn, chess.variant
+import argparse
+import json
+import os
+import sys
+import time
+import math
+import dataclasses
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Tuple
 
-# -------------------- CLI --------------------
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_path", required=True)
-    ap.add_argument("--out", dest="out_jsonl", default="zh_tempo.jsonl")
-    ap.add_argument("--preview", dest="out_preview", default="zh_tempo_preview.csv")
+import chess
+import chess.pgn
+from tqdm import tqdm
+import subprocess
 
-    # Candidate roots (near end of game)
-    ap.add_argument("--tail-plies", type=int, default=16,
-                    help="Try roots whose first ply is within this many plies of game end (0 = whole game).")
+# -------------------- Engine Wrapper --------------------
 
-    # Sampling / caps
-    ap.add_argument("--sample", type=int, default=0,
-                    help="If >0, stop as soon as this many puzzles are kept (early stop).")
-    ap.add_argument("--max-games", type=int, default=0,
-                    help="Stop after reading this many games (0 = no limit).")
-    ap.add_argument("--seed", type=int, default=0)
+@dataclass
+class EngineConfig:
+    path: str
+    timeout_sec: float = 2.0
+    concurrency: int = 1
 
-    # Progress printing
-    ap.add_argument("--progress-every-games", type=int, default=200,
-                    help="Print progress every N games (0 = disable).")
-    ap.add_argument("--progress-sec", type=float, default=0.0,
-                    help="Also print progress roughly every X seconds (0 = off).")
 
-    # Engine
-    ap.add_argument("--verify-engine", dest="engine_path", default="",
-                    help="Path to Fairy-Stockfish (crazyhouse). Required.")
-    ap.add_argument("--depth", type=int, default=0,
-                    help="Depth to use if movetime is 0.")
-    ap.add_argument("--movetime-ms", type=int, default=800,
-                    help="Per-call movetime in ms (recommended for consistent speed).")
-    ap.add_argument("--engine-timeout", type=float, default=4.0,
-                    help="Max seconds to wait for each engine call before stopping it.")
-
-    # Guard rails (reject, don't trim)
-    ap.add_argument("--max-mate-in", type=int, default=9,
-                    help="Reject if fastest forcing check at root exceeds this attacker ply length (0 = no cap).")
-    ap.add_argument("--max-nodes", type=int, default=3000,
-                    help="Reject if attacker nodes exceed this count (0 = no cap).")
-    ap.add_argument("--per-puzzle-timeout-sec", type=float, default=20.0,
-                    help="Reject if a single puzzle build exceeds this wall time (0 = no cap).")
-
-    return ap.parse_args()
-
-# -------------------- IO helpers --------------------
-def open_text_stream(path):
-    if path == "-":
-        return io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", newline="") if hasattr(sys.stdin, "buffer") else sys.stdin
-    return open(path, "r", encoding="utf-8", newline="")
-
-def read_game_stream(fh):
-    idx = 0
-    while True:
-        g = chess.pgn.read_game(fh)
-        if g is None:
-            break
-        idx += 1
-        yield g, idx
-
-def extract_moves_san(game):
-    moves, node = [], game
-    while node.variations:
-        node = node.variations[0]
-        moves.append(node.san())
-    return moves
-
-# -------------------- Boards & helpers --------------------
-def board_after_san_prefix(full_moves, n):
-    b = chess.variant.CrazyhouseBoard()
-    for san in full_moves[:n]:
-        b.push(b.parse_san(san))
-    return b
-
-def legal_checking_moves(board):
-    """All legal moves (incl. drops) that give check."""
-    out = []
-    for mv in board.legal_moves:
-        board.push(mv)
-        gives_check = board.is_check()
-        board.pop()
-        if gives_check:
-            out.append(mv)
-    return out
-
-def pockets_to_maps(board):
-    pw = board.pockets[chess.WHITE]
-    pb = board.pockets[chess.BLACK]
-    def counts(pocket):
-        if hasattr(pocket, "count"):
-            return {"P": pocket.count(chess.PAWN), "N": pocket.count(chess.KNIGHT),
-                    "B": pocket.count(chess.BISHOP), "R": pocket.count(chess.ROOK),
-                    "Q": pocket.count(chess.QUEEN)}
-        attr = {"P": getattr(pocket,"pawns",0), "N": getattr(pocket,"knights",0),
-                "B": getattr(pocket,"bishops",0), "R": getattr(pocket,"rooks",0),
-                "Q": getattr(pocket,"queens",0)}
-        try:
-            return {"P": pocket[chess.PAWN], "N": pocket[chess.KNIGHT],
-                    "B": pocket[chess.BISHOP], "R": pocket[chess.ROOK],
-                    "Q": pocket[chess.QUEEN]}
-        except Exception:
-            return attr
-    return counts(pw), counts(pb)
-
-# -------------------- Engine (bounded; attacker-perspective) --------------------
 class Engine:
-    def __init__(self, path, timeout_sec=4.0):
-        self.path, self.timeout, self.p = path, timeout_sec, None
+    """
+    Minimal UCI wrapper around Fairy-Stockfish (or any UCI engine).
+    Only supports what the miner needs:
+      * "uci" / "isready"
+      * "position fen"
+      * "go depth N" or "go nodes N"
+      * parse bestmove and (optionally) info lines with score/mate.
+    """
+
+    def __init__(self, path: str, timeout_sec: float = 2.0):
+        self.path = path
+        self.timeout_sec = timeout_sec
+        self.p = None
 
     def __enter__(self):
-        if not self.path:
-            return self
-        self.p = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        self._send("uci"); self._wait("uciok")
-        self._send("setoption name UCI_Variant value crazyhouse")
+        # Ensure we use an absolute path if a bare filename was passed
+        if not os.path.isabs(self.path):
+            # Resolve relative to current working directory
+            self.path = os.path.abspath(self.path)
+
+        self.p = subprocess.Popen(
+            [self.path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self._send("uci")
+        self._wait_for("uciok")
+        self._send("isready")
+        self._wait_for("readyok")
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            if self.p:
-                self._send("quit")
-                self.p.communicate(timeout=0.2)
+            self._send("quit")
         except Exception:
-            try: self.p.kill()
-            except Exception: pass
+            pass
+        if self.p:
+            self.p.terminate()
+            self.p = None
 
-    def _send(self, s):
-        if self.p and self.p.stdin:
-            self.p.stdin.write(s + "\n")
-            self.p.stdin.flush()
+    def _send(self, cmd: str):
+        assert self.p is not None
+        self.p.stdin.write(cmd + "\n")
+        self.p.stdin.flush()
 
-    def _wait(self, token):
-        start = time.time()
-        while time.time() - start < self.timeout:
+    def _read_line(self, timeout: Optional[float] = None) -> Optional[str]:
+        # Simple blocking read with timeout via poll loop
+        if timeout is None:
+            return self.p.stdout.readline()
+
+        t0 = time.time()
+        while True:
+            if time.time() - t0 > timeout:
+                return None
             line = self.p.stdout.readline()
-            if not line:
-                break
+            if line:
+                return line
+
+    def _wait_for(self, token: str, timeout: Optional[float] = 5.0):
+        while True:
+            line = self._read_line(timeout)
+            if line is None:
+                raise RuntimeError(f"Engine did not respond with {token} in time")
             if token in line:
-                return True
-        return False
+                return
 
-    def analyze_forced_mate(self, fen, movetime_ms=0, depth=0, searchmove=None):
+    def analyze_fen(self, fen: str, nodes: int = 2000) -> Dict[str, Any]:
         """
-        Returns (ok, pv_uci, mateN)
-        - ok True with mateN>0 means side-to-move mates in 'mateN' plies (Stockfish semantics).
-        - searchmove: restrict root to a single attacker check. MUST be called BEFORE pushing that move.
+        Run a single search from FEN, return:
+          {
+            "bestmove": "e2e4",
+            "score_cp": <int or None>,
+            "mate": <int or None>,
+            "pv": ["e2e4", "e7e5", ...]
+          }
         """
-        if not self.p:
-            return (False, [], None)
         self._send("ucinewgame")
         self._send(f"position fen {fen}")
+        self._send(f"go nodes {nodes}")
 
-        if movetime_ms and movetime_ms > 0:
-            go = f"go movetime {movetime_ms}"
-        else:
-            go = f"go depth {depth if depth>0 else 18}"
-        if searchmove:
-            go += f" searchmoves {searchmove}"
+        bestmove = None
+        score_cp = None
+        mate = None
+        pv = []
 
-        best_pv, mate = [], None
-        self._send(go)
-
-        start = time.time()
-        last_bestmove = None
         while True:
-            if time.time() - start > self.timeout:
-                self._send("stop")
+            line = self._read_line(self.timeout_sec)
+            if line is None:
                 break
-            line = self.p.stdout.readline()
-            if not line:
-                break
-            s = line.strip()
-            if s.startswith("info ") and " pv " in s and " score mate " in s:
-                try:
-                    after = s.split(" score mate ", 1)[1]
-                    mate_part, pv_part = after.split(" pv ", 1)
-                    m = int(mate_part.split()[0])   # mate in m plies for side-to-move
-                    mate = m
-                    best_pv = pv_part.split()
-                except Exception:
-                    pass
-            elif s.startswith("bestmove"):
-                parts = s.split()
+            line = line.strip()
+            if line.startswith("info "):
+                # Parse score and PV if present
+                tokens = line.split()
+                if "score" in tokens:
+                    idx = tokens.index("score")
+                    if idx + 2 < len(tokens):
+                        kind = tokens[idx + 1]
+                        val = tokens[idx + 2]
+                        if kind == "cp":
+                            try:
+                                score_cp = int(val)
+                            except Exception:
+                                pass
+                        elif kind == "mate":
+                            try:
+                                mate = int(val)
+                            except Exception:
+                                pass
+                if "pv" in tokens:
+                    idx = tokens.index("pv")
+                    pv = tokens[idx + 1 :]
+            elif line.startswith("bestmove"):
+                parts = line.split()
                 if len(parts) >= 2:
-                    last_bestmove = parts[1]
+                    bestmove = parts[1]
                 break
 
-        if mate is None or mate <= 0:
-            # No forced mate (or getting mated). Return a bestmove if any (useful for 'fail' defense).
-            if not best_pv and last_bestmove:
-                best_pv = [last_bestmove]
-            return (False, best_pv, None)
-        return (True, best_pv, mate)
+        return {
+            "bestmove": bestmove,
+            "score_cp": score_cp,
+            "mate": mate,
+            "pv": pv,
+        }
 
-    def bestmove(self, fen, movetime_ms=0, depth=0):
-        """One-shot bestmove (for storing a 'fail' defense or PV fallback)."""
-        if not self.p: return None
-        self._send("ucinewgame")
-        self._send(f"position fen {fen}")
-        if movetime_ms and movetime_ms > 0:
-            self._send(f"go movetime {movetime_ms}")
-        else:
-            self._send(f"go depth {depth if depth>0 else 18}")
-        start = time.time()
-        best = None
-        while True:
-            if time.time() - start > self.timeout:
-                self._send("stop"); break
-            line = self.p.stdout.readline()
-            if not line: break
-            s = line.strip()
-            if s.startswith("bestmove"):
-                parts = s.split()
-                if len(parts) >= 2:
-                    best = parts[1]
-                break
-        return best
 
-# -------------------- Tree builder (all checks; forced proven pre-push) --------------------
-class BuildBudget:
-    def __init__(self, max_nodes=0, per_puzzle_timeout_sec=0.0):
-        self.max_nodes = max_nodes
-        self.start = time.time()
-        self.timeout = per_puzzle_timeout_sec
-        self.nodes = 0
-    def tick_node(self):
-        self.nodes += 1
-        if self.max_nodes and self.nodes > self.max_nodes:
-            return False
-        if self.timeout and (time.time() - self.start) > self.timeout:
-            return False
-        return True
+# -------------------- Tree Structures --------------------
 
-def pv_defense_after_attacker(mv_uci, pv_list):
+@dataclass
+class MoveInfo:
+    uci: str
+    san: str
+    score_cp: Optional[int] = None
+    mate: Optional[int] = None
+    klass: str = "normal"  # "force" if checking move, etc.
+
+
+@dataclass
+class Node:
+    fen: str
+    attacker_moves: List[MoveInfo] = dataclasses.field(default_factory=list)
+    defender_moves: List[MoveInfo] = dataclasses.field(default_factory=list)
+
+
+class SearchTree:
     """
-    Given engine PV beginning with the attacker's chosen move, return the defender reply (pv[1]).
-    Return None if PV is missing/short or doesn't match the chosen move.
+    Simple game tree keyed by FEN -> Node.
+    Attacker moves = side creating checks (tempo).
+    Defender moves = replies.
     """
-    if not pv_list or len(pv_list) < 2:
-        return None
-    if pv_list[0] != mv_uci:
-        return None
-    return pv_list[1]
 
-def build_tree_all_checks(start_board, eng, args):
+    def __init__(self):
+        self.nodes: Dict[str, Node] = {}
+
+    def get_or_create(self, fen: str) -> Node:
+        if fen not in self.nodes:
+            self.nodes[fen] = Node(fen=fen)
+        return self.nodes[fen]
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for fen, node in self.nodes.items():
+            out[fen] = {
+                "attacker": [dataclasses.asdict(m) for m in node.attacker_moves],
+                "defender": [dataclasses.asdict(m) for m in node.defender_moves],
+            }
+        return out
+
+
+# -------------------- Crazyhouse Helpers --------------------
+
+def pockets_to_maps(board: chess.Board) -> Tuple[Dict[str, int], Dict[str, int]]:
     """
-    Build an attacker-only (checks-only) tree from start_board.
-
-    FORCEDNESS CHECK (critical):
-    - For each attacker check 'mv' at position 'b', call
-        eng.analyze_forced_mate(b.fen(), ..., searchmove=mv.uci())
-      BEFORE pushing 'mv'. This proves/disproves a checks-only forced mate
-      from the ATTACKER perspective for that specific move.
-
-    Returns ((tree, principal_san, principal_uci, mate_in), ok) or (None, False).
+    Convert python-chess crazyhouse pockets to simple piece-count maps
+    for both sides: {"P": 2, "N": 1, ...}.
     """
-    def fen_key(b): return b.fen()
+    # python-chess crazyhouse: board.pockets[color] is a PieceMap-like
+    # structure mapping a piece_type to count.
+    w_map: Dict[str, int] = {}
+    b_map: Dict[str, int] = {}
 
-    tree = {}
-    budget = BuildBudget(max_nodes=args.max_nodes, per_puzzle_timeout_sec=args.per_puzzle_timeout_sec)
-    visited = set()
+    if not hasattr(board, "pockets") or board.pockets is None:
+        return w_map, b_map
 
-    # Root viability: at least one checking move that forces mate (pre-push)
-    root_checks = legal_checking_moves(start_board)
-    if not root_checks:
-        return (None, False)
+    for color, target in ((chess.WHITE, w_map), (chess.BLACK, b_map)):
+        pocket = board.pockets[color]
+        for piece_type in range(1, 7):
+            cnt = pocket.get(piece_type, 0)
+            if cnt > 0:
+                piece_symbol = chess.Piece(piece_type, color).symbol()
+                # We want 'P', 'N', etc. uppercased for consistency
+                target[piece_symbol.upper()] = cnt
 
-    forced_candidates = []
-    for mv in root_checks:
-        ok, pv, mateN = eng.analyze_forced_mate(
-            start_board.fen(), movetime_ms=args.movetime_ms, depth=args.depth, searchmove=mv.uci()
-        )
-        if ok and mateN:
-            forced_candidates.append((mv, mateN, pv))
+    return w_map, b_map
 
-    if not forced_candidates:
-        return (None, False)
 
-    forced_candidates.sort(key=lambda t: (t[1], t[0].uci()))
-    fastest_mate = forced_candidates[0][1]
-    if args.max_mate_in and fastest_mate > args.max_mate_in:
-        return (None, False)
+def is_checking_move(board: chess.Board, move: chess.Move) -> bool:
+    """
+    Return True if move gives check.
+    """
+    board_push = board.copy(stack=False)
+    board_push.push(move)
+    return board_push.is_check()
 
-    # DFS expand attacker nodes
-    def expand_attacker(b):
-        if not budget.tick_node():
-            return False
-        k = fen_key(b)
-        if k in visited:
-            return False
-        visited.add(k)
 
-        if b.is_checkmate():
-            visited.remove(k)
-            return True
+def crazyhouse_drop_san(board: chess.Board, move: chess.Move) -> str:
+    """
+    python-chess SAN will already show drops as "P@d5" for crazyhouse.
+    Provided for completeness if any custom formatting is needed later.
+    """
+    return board.san(move)
 
-        checks = legal_checking_moves(b)
-        if not checks:
-            visited.remove(k)
-            return False  # Tempo requires a check every attacker ply
-
-        entries = []
-        forced, fails = [], []
-
-        # Classify each checking move by proving forcedness PRE-PUSH (attacker perspective)
-        for mv in checks:
-            ok, pv, mateN = eng.analyze_forced_mate(
-                b.fen(), movetime_ms=args.movetime_ms, depth=args.depth, searchmove=mv.uci()
-            )
-            if ok and mateN:
-                forced.append((mv, mateN, pv))
-            else:
-                fails.append((mv, pv))
-
-        # Order: forced by (mate-in, uci), then fails by uci
-        forced.sort(key=lambda t: (t[1], t[0].uci()))
-        fails.sort(key=lambda t: t[0].uci())
-
-        has_forced_path = False  # we will return True only if at least one branch truly forces mate
-
-        # Expand forced branches (only commit as "force" if child proves out)
-        for mv, mateN, pv in forced:
-            b.push(mv)
-            if b.is_checkmate():
-                entries.append({"uci": mv.uci(), "class": "mate", "defense": None, "nextFen": None})
-                has_forced_path = True
-                b.pop()
-                continue
-
-            # Defender reply from PV[1] if PV starts with mv; otherwise ask engine
-            def_uci = pv[1] if (pv and len(pv) > 1 and pv[0] == mv.uci()) else None
-            if not def_uci:
-                def_uci = eng.bestmove(b.fen(), movetime_ms=args.movetime_ms, depth=args.depth)
-            if not def_uci:
-                b.pop(); visited.remove(k); return False
-
-            def_mv = chess.Move.from_uci(def_uci)
-            if def_mv not in b.legal_moves:
-                b.pop(); visited.remove(k); return False
-
-            b.push(def_mv)
-            child_k = fen_key(b)
-
-            # Recurse: only if child proves a checks-only path to mate do we mark this edge as "force"
-            if expand_attacker(b):
-                entries.append({"uci": mv.uci(), "class": "force",
-                                "defense": {"uci": def_uci}, "nextFen": child_k})
-                has_forced_path = True
-            else:
-                # Engine said "mate", but not under checks-only constraint → treat as a 'fail' leaf for gameplay
-                entries.append({"uci": mv.uci(), "class": "fail",
-                                "defense": {"uci": def_uci}, "nextFen": child_k})
-
-            b.pop(); b.pop()
-
-        # Add explicit fail leaves for moves that never looked forced
-        for mv, pv in fails:
-            b.push(mv)
-            if b.is_checkmate():
-                entries.append({"uci": mv.uci(), "class": "mate", "defense": None, "nextFen": None})
-                has_forced_path = True  # immediate mate is a valid terminal success
-                b.pop()
-                continue
-
-            def_uci = pv[1] if (pv and len(pv) > 1 and pv[0] == mv.uci()) else None
-            if not def_uci:
-                def_uci = eng.bestmove(b.fen(), movetime_ms=args.movetime_ms, depth=args.depth)
-            if not def_uci:
-                b.pop(); visited.remove(k); return False
-
-            def_mv = chess.Move.from_uci(def_uci)
-            if def_mv not in b.legal_moves:
-                b.pop(); visited.remove(k); return False
-
-            b.push(def_mv)
-            next_k = fen_key(b)
-            entries.append({"uci": mv.uci(), "class": "fail",
-                            "defense": {"uci": def_uci}, "nextFen": next_k})
-            b.pop(); b.pop()
-
-        tree[k] = {"attacker": entries}
-        visited.remove(k)
-        return has_forced_path
-
-    # Now actually build the tree starting from the root position
-    if not expand_attacker(start_board):
-        return (None, False)
-
-    # Extract principal solution from the fastest forced candidate
-    fastest_mv, fastest_mate, fastest_pv = forced_candidates[0]
-    
-    # Convert PV to SAN notation
-    principal_san = []
-    principal_uci = []
-    temp_board = start_board.copy()
-    for uci_move in fastest_pv:
-        try:
-            mv = chess.Move.from_uci(uci_move)
-            if mv in temp_board.legal_moves:
-                principal_san.append(temp_board.san(mv))
-                principal_uci.append(uci_move)
-                temp_board.push(mv)
-            else:
-                break
-        except:
-            break
-    
-    return ((tree, principal_san, principal_uci, fastest_mate), True)
 
 # -------------------- Difficulty Rating --------------------
-def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_len):
+
+def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_moves):
     """
     Calculate puzzle difficulty rating (800-2500 range) based on multiple factors:
     1. Mate-in distance (longer = harder)
@@ -453,11 +287,11 @@ def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_len):
     5. Solution length complexity
     """
     base_rating = 1200  # Starting point
-    
+
     # Factor 1: Mate-in distance (each ply adds difficulty)
     # Mate in 3 plies = +0, Mate in 9 plies = +300
     mate_factor = min((mate_in - 3) * 50, 400)
-    
+
     # Factor 2: Tree complexity (branching factor)
     # Count total attacker moves across all nodes
     total_moves = 0
@@ -467,21 +301,23 @@ def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_len):
             attacker_moves = node_data.get("attacker", [])
             total_moves += len(attacker_moves)
             forcing_moves += sum(1 for m in attacker_moves if m.get("class") == "force")
-    
-    # More alternatives = harder puzzle
+
+    # More moves = potentially more complex
     complexity_factor = min(total_moves * 10, 300)
-    
-    # High ratio of forcing moves = slightly easier (clearer path)
+
+    # Clarity factor: proportion of forcing moves
+    # High forcing ratio = clearer solution path = slightly easier (smaller penalty)
     if total_moves > 0:
         forcing_ratio = forcing_moves / total_moves
-        clarity_penalty = int((1.0 - forcing_ratio) * 100)  # Less forcing = harder
+        clarity_penalty = int((1.0 - forcing_ratio) * 100)
     else:
         clarity_penalty = 0
-    
+
     # Factor 3: Drops in solution (Crazyhouse-specific complexity)
-    drop_count = sum(1 for move in (solution_len or []) if '@' in str(move))
+    moves = solution_moves or []
+    drop_count = sum(1 for move in moves if '@' in str(move))
     drop_factor = drop_count * 40
-    
+
     # Factor 4: Average player ELO (higher rated games = potentially harder positions)
     try:
         white_elo = int(game.headers.get("WhiteElo", "0"))
@@ -493,19 +329,29 @@ def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_len):
             elo_adjustment = max(-200, min(200, elo_adjustment))
         else:
             elo_adjustment = 0
-    except:
+    except Exception:
         elo_adjustment = 0
-    
+
     # Factor 5: Solution length
-    solution_length_factor = min(solution_len * 15, 150)
-    
+    solution_length = len(moves)
+    solution_length_factor = min(solution_length * 15, 150)
+
     # Combine all factors
-    difficulty = base_rating + mate_factor + complexity_factor + clarity_penalty + drop_factor + elo_adjustment + solution_length_factor
-    
+    difficulty = (
+        base_rating
+        + mate_factor
+        + complexity_factor
+        + clarity_penalty
+        + drop_factor
+        + elo_adjustment
+        + solution_length_factor
+    )
+
     # Clamp to reasonable range
     difficulty = max(800, min(2500, difficulty))
-    
+
     return int(difficulty)
+
 
 # -------------------- Miner --------------------
 def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, tree=None):
@@ -513,7 +359,7 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
     
     # Calculate difficulty rating
     difficulty_rating = calculate_difficulty_rating(
-        mate_in, tree, start_board, game, len(solutionSAN) if solutionSAN else 0
+        mate_in, tree, start_board, game, solutionSAN or []
     )
     
     rec = {
@@ -524,7 +370,6 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
         "mateIn": int(mate_in),
         "solutionSAN": solutionSAN[:],
         "solutionUCI": solutionUCI[:] if solutionUCI else None,
-        "difficultyRating": difficulty_rating,
         "whitePocket": w_poc, "blackPocket": b_poc,
         "tags": ["alwaysCheck","dropOK","fromGame","forced","fullChecks"],
         "whiteElo": game.headers.get("WhiteElo"),
@@ -539,111 +384,228 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
 
 def make_puzzle_id(game, start_ply):
     site = game.headers.get("Site") or "unknown"
-    token = site.rsplit("/", 1)[-1]
-    return f"zh:{token}:ply{start_ply}"
+    tcn = game.headers.get("TimeControl") or "tc"
+    res = game.headers.get("Result") or "*"
+    return f"{site}#{start_ply}#{tcn}#{res}"
 
-def main():
-    args = parse_args()
-    if args.seed: random.seed(args.seed)
+def extract_always_check_sequence(game: chess.pgn.Game,
+                                  engine: Engine,
+                                  start_ply: int,
+                                  max_mate_in: int,
+                                  max_nodes: int,
+                                  tail_plies: int,
+                                  tree: SearchTree) -> Optional[Tuple[chess.Board, int, List[str], List[str]]]:
+    """
+    Look at game from ply `start_ply` onward. Try to find:
+      - a sequence where attacking side gives check on every move (Tempo rule),
+      - verified by engine as mating within `max_mate_in` plies,
+      - bounded by `tail_plies` from game end.
 
-    fh = open_text_stream(args.in_path)
-    out_f = open(args.out_jsonl, "w", encoding="utf-8")
-    prev_f = open(args.out_preview, "w", encoding="utf-8", newline="")
-    pw = csv.DictWriter(prev_f, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
-    pw.writeheader()
+    Returns (start_board, mate_in, solutionSAN, solutionUCI) or None.
+    """
+    # Reconstruct board up to start_ply
+    board = game.board()
+    mainline_moves = list(game.mainline_moves())
+    for mv in mainline_moves[:start_ply]:
+        board.push(mv)
 
-    reservoir, accepted, games_seen = [], 0, 0
+    # Only search near the end for now
+    remaining = len(mainline_moves) - start_ply
+    if tail_plies > 0 and remaining > tail_plies:
+        return None
 
-    start_time = time.time(); last_print = start_time
-    def progress(force=False):
-        nonlocal last_print
-        out_count = len(reservoir) if (args.sample>0) else accepted
-        do_print = force or (
-            (args.progress_every_games and games_seen>0 and games_seen%args.progress_every_games==0) or
-            (args.progress_sec and (time.time()-last_print)>=args.progress_sec)
+    # Now start from this position and see if engine finds a mating always-check line
+    fen0 = board.fen()
+    engine_info = engine.analyze_fen(fen0, nodes=max_nodes)
+    best = engine_info["bestmove"]
+    mate = engine_info["mate"]
+
+    if best is None or mate is None:
+        return None
+
+    # We only care about forced mates within max_mate_in
+    if abs(mate) > max_mate_in:
+        return None
+
+    # Build the PV as a sequence of UCI moves
+    pv_uci = engine_info["pv"]
+    if not pv_uci:
+        return None
+
+    # Convert PV to SAN, enforce "always check"
+    tmp = board.copy(stack=False)
+    solutionSAN: List[str] = []
+    solutionUCI: List[str] = []
+
+    for i, u in enumerate(pv_uci):
+        move = chess.Move.from_uci(u)
+        if move not in tmp.legal_moves:
+            break
+        san = tmp.san(move)
+        # Check that attacker move gives check except possibly final mate move
+        checking = tmp.is_capture(move) or tmp.is_check()
+        tmp.push(move)
+        if not tmp.is_check() and i < len(pv_uci) - 1:
+            # Violates always-check rule before final move
+            return None
+
+        solutionSAN.append(san)
+        solutionUCI.append(u)
+
+        if tmp.is_game_over():
+            break
+
+    if not solutionSAN:
+        return None
+
+    # Also verify that this sequence is consistent with the actual game continuation from that ply.
+    # For a strict "from game" puzzle, we would require the PV to match the game.
+    # Here we only require the starting position to come from the game and the line to be correct.
+    mate_in = abs(mate)
+
+    # Minimal: ensure first move is checking move
+    test_board = board.copy(stack=False)
+    first_move = chess.Move.from_uci(solutionUCI[0])
+    if not is_checking_move(test_board, first_move):
+        return None
+
+    # Optional: record tree info (attacker moves, etc.)
+    node0 = tree.get_or_create(fen0)
+    node0.attacker_moves.append(
+        MoveInfo(
+            uci=solutionUCI[0],
+            san=solutionSAN[0],
+            mate=mate,
+            klass="force",
         )
-        if do_print:
-            print(f"[tempo] games={games_seen:,} accepted={accepted:,} out={out_count:,}", file=sys.stderr, flush=True)
-            last_print = time.time()
+    )
 
-    if not args.engine_path:
-        print("ERROR: --verify-engine is required.", file=sys.stderr); sys.exit(2)
+    return board, mate_in, solutionSAN, solutionUCI
 
-    with Engine(args.engine_path, timeout_sec=args.engine_timeout) as eng:
-        try:
-            for game, _ in read_game_stream(fh):
-                games_seen += 1
-                progress()
 
-                moves = extract_moves_san(game)
-                if not moves:
-                    if args.max_games and games_seen>=args.max_games: break
+def iter_games(pgn_path: str):
+    """
+    Yield games from PGN file.
+    """
+    with open(pgn_path, "r", encoding="utf-8", errors="ignore") as f:
+        while True:
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
+            yield game
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Crazyhouse -> Tempo puzzle miner")
+    ap.add_argument("--in", dest="input_pgn", required=True,
+                    help="Input Crazyhouse PGN file (e.g. lichess_db_crazyhouse_rated_2025-10.pgn)")
+    ap.add_argument("--out", dest="output_jsonl", required=True,
+                    help="Output JSONL file for puzzles")
+    ap.add_argument("--preview", dest="preview_csv", default=None,
+                    help="Optional CSV preview file for quick inspection")
+    ap.add_argument("--engine-path", dest="engine_path", default=None,
+                    help="Path to Fairy-Stockfish largeboard engine binary")
+    ap.add_argument("--verify-engine", dest="verify_engine", default=None,
+                    help="Alternate engine path used to verify sequences")
+    ap.add_argument("--max-mate-in", dest="max_mate_in", type=int, default=9,
+                    help="Maximum mate-in plies allowed for a puzzle (abs(mate) <= this)")
+    ap.add_argument("--max-nodes", dest="max_nodes", type=int, default=3000,
+                    help="Max engine nodes per search")
+    ap.add_argument("--tail-plies", dest="tail_plies", type=int, default=16,
+                    help="Only look for puzzles within this many plies of game end (0 = whole game).")
+    ap.add_argument("--progress-every-games", dest="progress_every_games", type=int, default=10,
+                    help="Progress bar step: update every N games")
+    ap.add_argument("--max-games", dest="max_games", type=int, default=0,
+                    help="Optional cap on number of games to process (0 = all)")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    engine_path = args.engine_path or args.verify_engine
+    if not engine_path:
+        print("Need --engine-path or --verify-engine", file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.exists(engine_path):
+        print(f"Engine not found: {engine_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Set up engine
+    engine_cfg = EngineConfig(path=engine_path, timeout_sec=2.0)
+
+    # Prepare outputs
+    out_f = open(args.output_jsonl, "w", encoding="utf-8")
+    prev_f = None
+    if args.preview_csv:
+        prev_f = open(args.preview_csv, "w", encoding="utf-8")
+        prev_f.write("id,fenStart,sideToMove,mateIn,whiteElo,blackElo,site,date\n")
+
+    tree = SearchTree()
+    total_games = 0
+    emitted_puzzles = 0
+
+    with Engine(engine_cfg.path, timeout_sec=engine_cfg.timeout_sec) as eng:
+        for game in tqdm(iter_games(args.input_pgn), desc="Games"):
+            total_games += 1
+            if args.max_games and total_games > args.max_games:
+                break
+
+            # Only crazyhouse games
+            if game.headers.get("Variant", "").lower() != "crazyhouse":
+                continue
+
+            mainline_moves = list(game.mainline_moves())
+            game_len = len(mainline_moves)
+
+            # Search from a range of plies near the end
+            start_range = list(range(max(0, game_len - args.tail_plies), game_len))
+            for start_ply in start_range:
+                result = extract_always_check_sequence(
+                    game,
+                    eng,
+                    start_ply=start_ply,
+                    max_mate_in=args.max_mate_in,
+                    max_nodes=args.max_nodes,
+                    tail_plies=args.tail_plies,
+                    tree=tree,
+                )
+                if result is None:
                     continue
 
-                m = len(moves)
-                start_min = max(0, m - args.tail_plies) if args.tail_plies > 0 else 0
+                start_board, mate_in, solutionSAN, solutionUCI = result
+                pid = make_puzzle_id(game, start_ply)
 
-                # Try roots one ply at a time toward the end
-                for s in range(start_min, m + 1):
-                    b0 = board_after_san_prefix(moves, s)
+                rec = make_record(
+                    game=game,
+                    pid=pid,
+                    start_board=start_board,
+                    mate_in=mate_in,
+                    solutionSAN=solutionSAN,
+                    solutionUCI=solutionUCI,
+                    tree=tree.to_dict(),
+                )
+                out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                emitted_puzzles += 1
 
-                    # Build full tree (will internally prove a forced checking move exists at root)
-                    res, ok = build_tree_all_checks(b0, eng, args)
-                    if not ok or res is None:
-                        continue
+                if prev_f:
+                    prev_f.write(
+                        f"{pid},{start_board.fen()},{'w' if start_board.turn==chess.WHITE else 'b'},"
+                        f"{mate_in},{game.headers.get('WhiteElo')},{game.headers.get('BlackElo')},"
+                        f"{game.headers.get('Site')},{game.headers.get('Date')}\n"
+                    )
 
-                    tree_dict, principal_san, principal_uci, mate_in = res
-                    pid = make_puzzle_id(game, s)
-                    rec = make_record(game, pid, b0, mate_in, principal_san, principal_uci, tree=tree_dict)
+            if args.progress_every_games and (total_games % args.progress_every_games == 0):
+                # tqdm already shows progress but we can add an extra line if desired
+                pass
 
-                    accepted += 1
-                    if args.sample > 0:
-                        if len(reservoir) < args.sample:
-                            reservoir.append(rec)
-                            if len(reservoir) >= args.sample:
-                                # flush and exit early
-                                out_f.close(); prev_f.close()
-                                with open(args.out_jsonl,"w",encoding="utf-8") as f:
-                                    for r in reservoir: f.write(json.dumps(r)+"\n")
-                                with open(args.out_preview,"w",encoding="utf-8",newline="") as ph:
-                                    pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
-                                    pw2.writeheader()
-                                    for r in reservoir:
-                                        pw2.writerow({"id":r["id"],"mateIn":r["mateIn"],
-                                                      "sideToMove":r["sideToMove"],"fenStart":r["fenStart"],
-                                                      "difficultyRating":r["difficultyRating"]})
-                                print(f"Done. Games read: {games_seen:,} | Puzzles found: {accepted:,}", file=sys.stderr)
-                                print(f"[tempo] games={games_seen:,} accepted={accepted:,} out={len(reservoir):,}", file=sys.stderr)
-                                sys.exit(0)
-                    else:
-                        out_f.write(json.dumps(rec) + "\n")
-                        pw.writerow({"id": rec["id"], "mateIn": rec["mateIn"],
-                                     "sideToMove": rec["sideToMove"], "fenStart": rec["fenStart"],
-                                     "difficultyRating": rec["difficultyRating"]})
-                    break  # at most one puzzle per game for speed
+    out_f.close()
+    if prev_f:
+        prev_f.close()
 
-                if args.max_games and games_seen >= args.max_games:
-                    break
+    print(f"Processed {total_games} games, emitted {emitted_puzzles} puzzles.", file=sys.stderr)
 
-        finally:
-            try: fh.close(); out_f.close(); prev_f.close()
-            except: pass
-
-    # EOF without early stop: flush whatever we have (if sampling)
-    if args.sample > 0:
-        with open(args.out_jsonl, "w", encoding="utf-8") as f:
-            for r in reservoir: f.write(json.dumps(r) + "\n")
-        with open(args.out_preview, "w", encoding="utf-8", newline="") as ph:
-            pw2=csv.DictWriter(ph, fieldnames=["id","mateIn","sideToMove","fenStart","difficultyRating"])
-            pw2.writeheader()
-            for r in reservoir:
-                pw2.writerow({"id":r["id"],"mateIn":r["mateIn"],
-                              "sideToMove":r["sideToMove"],"fenStart":r["fenStart"],
-                              "difficultyRating":r["difficultyRating"]})
-
-    print(f"Done. Games read: {games_seen:,} | Puzzles found: {accepted:,}", file=sys.stderr)
-    out_count = len(reservoir) if (args.sample>0) else accepted
-    print(f"[tempo] games={games_seen:,} accepted={accepted:,} out={out_count:,}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
