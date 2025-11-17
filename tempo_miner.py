@@ -281,78 +281,72 @@ def crazyhouse_drop_san(board: chess.Board, move: chess.Move) -> str:
 
 def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_moves):
     """
-    Calculate puzzle difficulty rating (800-2500 range) based on multiple factors:
-    1. Mate-in distance (longer = harder)
-    2. Number of alternative moves to consider (branching factor)
-    3. Presence of drops in solution
-    4. Average player rating from game
-    5. Solution length complexity
+    Calculate puzzle difficulty rating (800-2500 range) for Tempo puzzles.
+    
+    Key factors:
+    1. Mate depth (exponential - longer forcing sequences are harder)
+    2. Drop moves (adds tactical complexity unique to Crazyhouse)
+    3. Pocket complexity (more pieces = more candidate moves to consider)
+    4. Source game quality (higher rated games = better tactics)
+    5. Endgame positions (fewer pieces = harder calculation)
+    
+    Note: In Tempo, all attacking moves are checks (forcing), so we don't
+    distinguish quiet vs forcing moves.
     """
-    base_rating = 1200  # Starting point
-
-    # Factor 1: Mate-in distance (each ply adds difficulty)
-    # Mate in 3 plies = +0, Mate in 9 plies = +300
-    mate_factor = min((mate_in - 3) * 50, 400)
-
-    # Factor 2: Tree complexity (branching factor)
-    # Count total attacker moves across all nodes
-    total_moves = 0
-    forcing_moves = 0
-    if tree:
-        for fen_key, node_data in tree.items():
-            attacker_moves = node_data.get("attacker", [])
-            total_moves += len(attacker_moves)
-            forcing_moves += sum(1 for m in attacker_moves if m.get("class") == "force")
-
-    # More moves = potentially more complex
-    complexity_factor = min(total_moves * 10, 300)
-
-    # Clarity factor: proportion of forcing moves
-    # High forcing ratio = clearer solution path = slightly easier (smaller penalty)
-    if total_moves > 0:
-        forcing_ratio = forcing_moves / total_moves
-        clarity_penalty = int((1.0 - forcing_ratio) * 100)
-    else:
-        clarity_penalty = 0
-
-    # Factor 3: Drops in solution (Crazyhouse-specific complexity)
-    moves = solution_moves or []
-    drop_count = sum(1 for move in moves if '@' in str(move))
-    drop_factor = drop_count * 40
-
-    # Factor 4: Average player ELO (higher rated games = potentially harder positions)
+    base_rating = 1000
+    
+    # Factor 1: Mate depth (exponential - longer sequences much harder)
+    # mate_in=1: 10, mate_in=3: 90, mate_in=5: 250, mate_in=9: 810
+    mate_factor = mate_in * mate_in * 10
+    
+    # Factor 2: Crazyhouse drops (harder to visualize and calculate)
+    drop_count = sum(1 for m in (solution_moves or []) if '@' in str(m))
+    drop_factor = drop_count * 50
+    
+    # Factor 3: Pocket complexity (more pieces in pocket = more candidate moves)
+    pocket_factor = 0
+    if hasattr(start_board, 'pockets') and start_board.pockets is not None:
+        try:
+            white_pocket_count = sum(start_board.pockets[chess.WHITE].count(pt) for pt in range(1, 7))
+            black_pocket_count = sum(start_board.pockets[chess.BLACK].count(pt) for pt in range(1, 7))
+            total_pocket_pieces = white_pocket_count + black_pocket_count
+            pocket_factor = total_pocket_pieces * 15
+        except:
+            pocket_factor = 0
+    
+    # Factor 4: Source game quality (higher rated games = better tactics)
     try:
-        white_elo = int(game.headers.get("WhiteElo", "0"))
-        black_elo = int(game.headers.get("BlackElo", "0"))
-        if white_elo > 0 and black_elo > 0:
-            avg_elo = (white_elo + black_elo) / 2
-            # Use player ELO as a baseline adjustment (±200 range)
-            elo_adjustment = int((avg_elo - 1500) * 0.2)
-            elo_adjustment = max(-200, min(200, elo_adjustment))
-        else:
-            elo_adjustment = 0
-    except Exception:
+        white_elo = int(game.headers.get("WhiteElo", "1500"))
+        black_elo = int(game.headers.get("BlackElo", "1500"))
+        avg_elo = (white_elo + black_elo) / 2
+        # Adjust based on player strength (±150 range)
+        elo_adjustment = (avg_elo - 1500) * 0.15
+        elo_adjustment = max(-150, min(150, elo_adjustment))
+    except:
         elo_adjustment = 0
-
-    # Factor 5: Solution length
-    solution_length = len(moves)
-    solution_length_factor = min(solution_length * 15, 150)
-
+    
+    # Factor 5: Endgame bonus (fewer pieces = harder to calculate precisely)
+    try:
+        piece_count = len(start_board.piece_map())
+        # More bonus as piece count decreases (endgames are tactically harder)
+        endgame_bonus = max(0, (32 - piece_count) * 5)
+    except:
+        endgame_bonus = 0
+    
     # Combine all factors
     difficulty = (
         base_rating
         + mate_factor
-        + complexity_factor
-        + clarity_penalty
         + drop_factor
+        + pocket_factor
         + elo_adjustment
-        + solution_length_factor
+        + endgame_bonus
     )
-
+    
     # Clamp to reasonable range
-    difficulty = max(800, min(2500, difficulty))
-
-    return int(difficulty)
+    difficulty = max(800, min(2500, int(difficulty)))
+    
+    return difficulty
 
 
 # -------------------- Miner --------------------
@@ -577,6 +571,9 @@ def main(argv=None):
             mainline_moves = list(game.mainline_moves())
             game_len = len(mainline_moves)
 
+            # Collect all candidate puzzles from this game
+            game_candidates = []
+            
             # Search from a range of plies near the end
             start_range = list(range(max(0, game_len - args.tail_plies), game_len))
             for start_ply in start_range:
@@ -605,7 +602,12 @@ def main(argv=None):
                     solutionUCI=solutionUCI,
                     tree=None,  # Tree not needed for basic puzzle usage
                 )
-                all_puzzles.append(rec)
+                game_candidates.append(rec)
+
+            # Only keep the puzzle with the longest mate sequence from this game
+            if game_candidates:
+                best_puzzle = max(game_candidates, key=lambda p: p["mateIn"])
+                all_puzzles.append(best_puzzle)
 
             if args.progress_every_games and (total_games % args.progress_every_games == 0):
                 # tqdm already shows progress but we can add an extra line if desired
