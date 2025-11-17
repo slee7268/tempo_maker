@@ -90,6 +90,8 @@ class Engine:
         )
         self._send("uci")
         self._wait_for("uciok")
+        # CRITICAL: Set variant to crazyhouse to enable drop moves
+        self._send("setoption name UCI_Variant value crazyhouse")
         self._send("isready")
         self._wait_for("readyok")
         return self
@@ -364,29 +366,34 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
     
     rec = {
         "id": pid,
-        "variant": "crazyhouse",
         "fenStart": start_board.fen(),
         "sideToMove": "w" if start_board.turn==chess.WHITE else "b",
         "mateIn": int(mate_in),
         "solutionSAN": solutionSAN[:],
         "solutionUCI": solutionUCI[:] if solutionUCI else None,
-        "whitePocket": w_poc, "blackPocket": b_poc,
+        "whitePocket": w_poc, 
+        "blackPocket": b_poc,
+        "difficultyRating": difficulty_rating,
         "tags": ["alwaysCheck","dropOK","fromGame","forced","fullChecks"],
         "whiteElo": game.headers.get("WhiteElo"),
         "blackElo": game.headers.get("BlackElo"),
         "result": game.headers.get("Result"),
         "site": game.headers.get("Site"),
-        "date": game.headers.get("Date"),
     }
-    if tree is not None:
-        rec["tree"] = tree
+    # COMMENTED OUT: Tree is not needed for basic puzzle usage
+    # if tree is not None:
+    #     rec["tree"] = tree
     return rec
 
-def make_puzzle_id(game, start_ply):
+def make_puzzle_id(game, start_ply, puzzle_counter):
+    """Generate unique puzzle ID from game site URL and puzzle counter."""
     site = game.headers.get("Site") or "unknown"
-    tcn = game.headers.get("TimeControl") or "tc"
-    res = game.headers.get("Result") or "*"
-    return f"{site}#{start_ply}#{tcn}#{res}"
+    # Extract just the game ID from the Lichess URL
+    if "lichess.org/" in site:
+        game_id = site.split("/")[-1]
+    else:
+        game_id = site
+    return f"{game_id}_ply{start_ply}_p{puzzle_counter}"
 
 def extract_always_check_sequence(game: chess.pgn.Game,
                                   engine: Engine,
@@ -415,6 +422,7 @@ def extract_always_check_sequence(game: chess.pgn.Game,
         return None
 
     # Now start from this position and see if engine finds a mating always-check line
+    # board.fen() for Crazyhouse includes pocket notation [QPnb] automatically
     fen0 = board.fen()
     engine_info = engine.analyze_fen(fen0, nodes=max_nodes)
     best = engine_info["bestmove"]
@@ -433,20 +441,28 @@ def extract_always_check_sequence(game: chess.pgn.Game,
         return None
 
     # Convert PV to SAN, enforce "always check"
+    # CRITICAL: Attacker moves are at indices 0, 2, 4, ... (every other move starting from 0)
+    # Defender moves are at indices 1, 3, 5, ...
+    # We need EVERY attacker move to give check (including the final checkmate)
     tmp = board.copy(stack=False)
     solutionSAN: List[str] = []
     solutionUCI: List[str] = []
+    attacker_turn = tmp.turn  # Remember who is the attacking side
 
     for i, u in enumerate(pv_uci):
         move = chess.Move.from_uci(u)
         if move not in tmp.legal_moves:
             break
         san = tmp.san(move)
-        # Check that attacker move gives check except possibly final mate move
-        checking = tmp.is_capture(move) or tmp.is_check()
+        
+        is_attacker_move = (tmp.turn == attacker_turn)
+        
+        # Push the move to see if it results in check
         tmp.push(move)
-        if not tmp.is_check() and i < len(pv_uci) - 1:
-            # Violates always-check rule before final move
+        
+        # If this is an attacker move, it MUST result in check
+        if is_attacker_move and not tmp.is_check():
+            # Violates always-check rule
             return None
 
         solutionSAN.append(san)
@@ -458,27 +474,28 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     if not solutionSAN:
         return None
 
-    # Also verify that this sequence is consistent with the actual game continuation from that ply.
-    # For a strict "from game" puzzle, we would require the PV to match the game.
-    # Here we only require the starting position to come from the game and the line to be correct.
-    mate_in = abs(mate)
+    # Count only attacker moves for mate-in calculation
+    # Attacker moves are at indices 0, 2, 4, ...
+    attacker_move_count = (len(solutionSAN) + 1) // 2
+    mate_in = attacker_move_count
 
-    # Minimal: ensure first move is checking move
+    # Verify first move is by attacker and gives check
     test_board = board.copy(stack=False)
     first_move = chess.Move.from_uci(solutionUCI[0])
     if not is_checking_move(test_board, first_move):
         return None
 
     # Optional: record tree info (attacker moves, etc.)
-    node0 = tree.get_or_create(fen0)
-    node0.attacker_moves.append(
-        MoveInfo(
-            uci=solutionUCI[0],
-            san=solutionSAN[0],
-            mate=mate,
-            klass="force",
-        )
-    )
+    # COMMENTED OUT: Tree is not needed for basic puzzle usage
+    # node0 = tree.get_or_create(fen0)
+    # node0.attacker_moves.append(
+    #     MoveInfo(
+    #         uci=solutionUCI[0],
+    #         san=solutionSAN[0],
+    #         mate=mate,
+    #         klass="force",
+    #     )
+    # )
 
     return board, mate_in, solutionSAN, solutionUCI
 
@@ -540,14 +557,15 @@ def main(argv=None):
     prev_f = None
     if args.preview_csv:
         prev_f = open(args.preview_csv, "w", encoding="utf-8")
-        prev_f.write("id,fenStart,sideToMove,mateIn,whiteElo,blackElo,site,date\n")
+        prev_f.write("id,fenStart,sideToMove,mateIn,difficultyRating,whiteElo,blackElo,site\n")
 
     tree = SearchTree()
     total_games = 0
-    emitted_puzzles = 0
+    puzzle_counter = 0
+    all_puzzles = []  # Collect all puzzles in memory to sort by difficulty
 
     with Engine(engine_cfg.path, timeout_sec=engine_cfg.timeout_sec) as eng:
-        for game in tqdm(iter_games(args.input_pgn), desc="Games"):
+        for game in tqdm(iter_games(args.input_pgn), desc="Mining puzzles"):
             total_games += 1
             if args.max_games and total_games > args.max_games:
                 break
@@ -575,7 +593,8 @@ def main(argv=None):
                     continue
 
                 start_board, mate_in, solutionSAN, solutionUCI = result
-                pid = make_puzzle_id(game, start_ply)
+                puzzle_counter += 1
+                pid = make_puzzle_id(game, start_ply, puzzle_counter)
 
                 rec = make_record(
                     game=game,
@@ -584,27 +603,42 @@ def main(argv=None):
                     mate_in=mate_in,
                     solutionSAN=solutionSAN,
                     solutionUCI=solutionUCI,
-                    tree=tree.to_dict(),
+                    tree=None,  # Tree not needed for basic puzzle usage
                 )
-                out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                emitted_puzzles += 1
-
-                if prev_f:
-                    prev_f.write(
-                        f"{pid},{start_board.fen()},{'w' if start_board.turn==chess.WHITE else 'b'},"
-                        f"{mate_in},{game.headers.get('WhiteElo')},{game.headers.get('BlackElo')},"
-                        f"{game.headers.get('Site')},{game.headers.get('Date')}\n"
-                    )
+                all_puzzles.append(rec)
 
             if args.progress_every_games and (total_games % args.progress_every_games == 0):
                 # tqdm already shows progress but we can add an extra line if desired
                 pass
 
+    # Sort puzzles by difficulty rating (easiest to hardest)
+    print(f"\nSorting {len(all_puzzles)} puzzles by difficulty...", file=sys.stderr)
+    all_puzzles.sort(key=lambda p: p["difficultyRating"])
+
+    # Write sorted puzzles to output
+    print(f"Writing sorted puzzles to {args.output_jsonl}...", file=sys.stderr)
+    for rec in all_puzzles:
+        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # Write CSV preview if requested
+    if prev_f:
+        for rec in all_puzzles:
+            start_fen = rec["fenStart"]
+            prev_f.write(
+                f"{rec['id']},{start_fen},{rec['sideToMove']},"
+                f"{rec['mateIn']},{rec['difficultyRating']},"
+                f"{rec.get('whiteElo', '')},"
+                f"{rec.get('blackElo', '')},"
+                f"{rec.get('site', '')}\n"
+            )
+
     out_f.close()
     if prev_f:
         prev_f.close()
 
-    print(f"Processed {total_games} games, emitted {emitted_puzzles} puzzles.", file=sys.stderr)
+    print(f"Processed {total_games} games, emitted {len(all_puzzles)} puzzles.", file=sys.stderr)
+    if all_puzzles:
+        print(f"Difficulty range: {all_puzzles[0]['difficultyRating']} - {all_puzzles[-1]['difficultyRating']}", file=sys.stderr)
 
 
 if __name__ == "__main__":
