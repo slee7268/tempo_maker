@@ -202,10 +202,23 @@ class MoveInfo:
 
 
 @dataclass
+class EngineMove:
+    """Represents a move with its engine evaluation."""
+    move: chess.Move
+    eval: int  # cp value or mate score converted to cp (mate * 10000)
+
+
+@dataclass
 class Node:
     fen: str
     attacker_moves: List[MoveInfo] = dataclasses.field(default_factory=list)
     defender_moves: List[MoveInfo] = dataclasses.field(default_factory=list)
+    # Enhanced metadata for difficulty/theme/fun scoring
+    to_move: Optional[str] = None  # "attacker" or "defender"
+    best_move: Optional[chess.Move] = None  # engine-selected best move
+    engine_moves: List[EngineMove] = dataclasses.field(default_factory=list)  # ordered list
+    checking_moves: List[chess.Move] = dataclasses.field(default_factory=list)  # for attacker
+    legal_moves: List[chess.Move] = dataclasses.field(default_factory=list)  # for defender
 
 
 class SearchTree:
@@ -349,13 +362,361 @@ def calculate_difficulty_rating(mate_in, tree, start_board, game, solution_moves
     return difficulty
 
 
+def calculate_difficulty_rating_v2(mate_in, tree, start_board, game, solution_nodes):
+    """
+    Calculate puzzle difficulty rating v2 (800-2500 range) using enhanced tree features.
+    
+    This version uses per-node metadata including branching factors, evaluation gaps,
+    and drop timing for a more nuanced difficulty assessment.
+    """
+    base = 1000
+
+    # ---- Mate depth term (normalized) ----
+    mate_moves = max(1, mate_in / 2)
+    mate_term = min(1.0, (mate_moves - 1) / 7.0)
+
+    # ---- Initialize lists ----
+    att_branches = []
+    def_branches = []
+    only_move_count = 0
+    eval_gaps = []
+    drop_count = 0
+    first_drop_ply = None
+
+    # ---- Analyze solution path ----
+    for depth, node in enumerate(solution_nodes):
+        if node.to_move == "attacker":
+            # branch factor
+            att_branches.append(len(node.checking_moves))
+
+            # eval gap best vs second best
+            if len(node.engine_moves) >= 2:
+                ev_best = node.engine_moves[0].eval
+                ev_second = node.engine_moves[1].eval
+                eval_gaps.append(ev_best - ev_second)
+
+                if ev_best > 500 and ev_second < 100:
+                    only_move_count += 1
+
+            # drops
+            if node.best_move and '@' in str(node.best_move):
+                drop_count += 1
+                if first_drop_ply is None:
+                    first_drop_ply = depth
+        else:
+            # defender branching
+            def_branches.append(len(node.legal_moves))
+
+    # ---- Averages and normalizations ----
+    avg_att_branch = sum(att_branches)/len(att_branches) if att_branches else 1
+    avg_def_branch = sum(def_branches)/len(def_branches) if def_branches else 1
+    avg_gap = sum(eval_gaps)/len(eval_gaps) if eval_gaps else 0
+
+    branch_term = min(1.0, (avg_att_branch - 1)/4.0)
+    def_term = min(1.0, (avg_def_branch - 1)/6.0)
+    only_term = min(1.0, only_move_count/4.0)
+    gap_term = min(1.0, max(0, avg_gap)/500.0)
+    drop_term = min(1.0, drop_count/3.0)
+
+    if first_drop_ply is None:
+        drop_delay_term = 0.5
+    else:
+        drop_delay_term = min(1.0, first_drop_ply/8.0)
+
+    # pockets
+    if hasattr(start_board, "pockets"):
+        white_p = sum(start_board.pockets[chess.WHITE].count(pt) for pt in chess.PIECE_TYPES)
+        black_p = sum(start_board.pockets[chess.BLACK].count(pt) for pt in chess.PIECE_TYPES)
+        pocket_term = min(1.0, (white_p + black_p)/8.0)
+    else:
+        pocket_term = 0
+
+    piece_count = len(start_board.piece_map())
+    piece_term = min(1.0, max(0, (32 - piece_count)/22.0))
+
+    # source game elo
+    try:
+        we = int(game.headers.get("WhiteElo", 1500))
+        be = int(game.headers.get("BlackElo", 1500))
+        avg_elo = (we + be)/2
+    except:
+        avg_elo = 1500
+    elo_term = min(1.0, max(0, (avg_elo - 1200)/800.0))
+
+    # total difficulty (0–1)
+    difficulty_0_1 = (
+        0.25 * mate_term +
+        0.15 * branch_term +
+        0.10 * def_term +
+        0.15 * only_term +
+        0.10 * gap_term +
+        0.10 * drop_term +
+        0.05 * drop_delay_term +
+        0.05 * pocket_term +
+        0.03 * piece_term +
+        0.02 * elo_term
+    )
+
+    return int(800 + difficulty_0_1 * (2500 - 800))
+
+
+def detect_themes(start_board, solution_moves, final_board):
+    """
+    Detect tactical themes present in the puzzle.
+    
+    Args:
+        start_board: Initial board position
+        solution_moves: List of chess.Move objects in the solution
+        final_board: Board position after all solution moves
+    
+    Returns:
+        List of theme strings
+    """
+    themes = []
+
+    # --- helpers ---
+    def king_square(board, color):
+        return board.king(color)
+
+    # final move
+    final_move = solution_moves[-1]
+
+    # --- Back-rank mate ---
+    king = king_square(final_board, not start_board.turn)
+    if king is not None:
+        rank = chess.square_rank(king)
+        if rank in (0, 7):
+            attacker = final_board.piece_at(final_move.to_square)
+            if attacker and attacker.piece_type in (chess.QUEEN, chess.ROOK):
+                themes.append("back_rank")
+
+    # --- Smothered mate ---
+    if final_board.is_checkmate():
+        king = king_square(final_board, not start_board.turn)
+        attacker = final_board.piece_at(final_move.to_square)
+        if attacker and attacker.piece_type == chess.KNIGHT:
+            blocked = True
+            for sq in final_board.attacks(king):
+                if final_board.is_legal(chess.Move(king, sq)):
+                    blocked = False
+                    break
+            if blocked:
+                themes.append("smothered")
+
+    # --- Double check ---
+    if final_board.is_check():
+        num_attackers = 0
+        king = king_square(final_board, not start_board.turn)
+        if king is not None:
+            for sq in final_board.attackers(start_board.turn, king):
+                num_attackers += 1
+            if num_attackers >= 2:
+                themes.append("double_check")
+
+    # --- Sacrifice detection ---
+    # Compare material before/after first attacking move
+    def material_value(board):
+        val = 0
+        for p in board.piece_map().values():
+            piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, 
+                          chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+            val += piece_values.get(p.piece_type, 0)
+        return val
+
+    init_board_copy = start_board.copy()
+    initial_material = material_value(init_board_copy)
+    init_board_copy.push(solution_moves[0])
+    after_material = material_value(init_board_copy)
+
+    if after_material < initial_material:
+        themes.append("sacrifice")
+        lost = initial_material - after_material
+        if lost >= 9:
+            themes.append("queen_sac")
+
+    # --- Promotion ---
+    for m in solution_moves:
+        if m.promotion:
+            themes.append("promotion")
+            if m.promotion != chess.QUEEN:
+                themes.append("underpromotion")
+            break  # Only count once
+
+    # --- Drop-based themes ---
+    if '@' in str(final_move):
+        themes.append("drop_mate")
+
+    for m in solution_moves:
+        if '@' in str(m):
+            # detect whether drop blocks king escape by adjacency
+            dropped_sq = m.to_square
+            king = king_square(start_board, not start_board.turn)
+            if king is not None and chess.square_distance(king, dropped_sq) == 1:
+                themes.append("drop_block")
+                break
+
+    # --- Clearance candidate ---
+    # heuristic: if first attacking move vacates line later used by checking piece
+    # (soft heuristic - simple approximation)
+    if len(solution_moves) >= 3:
+        first = solution_moves[0]
+        # Check if first move opens a line
+        if first.from_square is not None and first.to_square is not None:
+            themes.append("clearance")
+
+    return list(set(themes))
+
+
+def calculate_fun_score(themes, material_sacrifice, mate_in, avg_att_branch):
+    """
+    Calculate a fun score (0-10) based on puzzle characteristics.
+    
+    Args:
+        themes: List of theme strings
+        material_sacrifice: Material value sacrificed
+        mate_in: Number of moves to mate
+        avg_att_branch: Average attacker branching factor
+    
+    Returns:
+        Float score between 0.0 and 10.0
+    """
+    score = 0.0
+
+    theme_weights = {
+        "queen_sac": 3.0,
+        "smothered": 3.0,
+        "drop_mate": 3.0,
+        "double_check": 2.0,
+        "clearance": 2.0,
+        "quiet_move": 2.0,
+        "back_rank": 1.5,
+        "drop_block": 1.5,
+        "deflection": 1.5,
+        "interference": 1.5,
+        "promotion": 1.0,
+        "underpromotion": 2.0,
+    }
+
+    for t in themes:
+        score += theme_weights.get(t, 0)
+
+    score += min(3.0, material_sacrifice / 3.0)
+
+    if 3 <= mate_in <= 6:
+        score += 2.0
+
+    if avg_att_branch > 5:
+        score -= (avg_att_branch - 5) * 0.5
+
+    return max(0.0, min(10.0, score))
+
+
 # -------------------- Miner --------------------
-def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, tree=None):
+def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, tree=None, engine=None):
     w_poc, b_poc = pockets_to_maps(start_board)
     
-    # Calculate difficulty rating
+    # Calculate old difficulty rating
     difficulty_rating = calculate_difficulty_rating(
         mate_in, tree, start_board, game, solutionSAN or []
+    )
+    
+    # Build solution_nodes with enhanced metadata for v2 scoring
+    solution_nodes = []
+    solution_moves = []
+    
+    # Convert solutionUCI to Move objects
+    if solutionUCI:
+        board_copy = start_board.copy()
+        attacker_color = start_board.turn
+        
+        for uci_move in solutionUCI:
+            move = chess.Move.from_uci(uci_move)
+            solution_moves.append(move)
+            
+            # Create node for this position
+            node = Node(fen=board_copy.fen())
+            node.to_move = "attacker" if board_copy.turn == attacker_color else "defender"
+            node.best_move = move
+            
+            # Populate checking moves for attacker or legal moves for defender
+            if node.to_move == "attacker":
+                node.checking_moves = [m for m in board_copy.legal_moves 
+                                      if is_checking_move(board_copy, m)]
+            else:
+                node.legal_moves = list(board_copy.legal_moves)
+            
+            # Get engine analysis for this position if engine is available
+            if engine:
+                try:
+                    # Analyze this position to get move ordering
+                    engine_result = engine.analyze_fen(board_copy.fen(), nodes=1000)
+                    
+                    # Build engine_moves list (simplified - just get a few top moves)
+                    # In a full implementation, we'd use multipv to get multiple moves
+                    if engine_result.get("bestmove"):
+                        score_cp = engine_result.get("score_cp", 0)
+                        mate_score = engine_result.get("mate")
+                        # Convert mate to cp-like score
+                        eval_score = mate_score * 10000 if mate_score else (score_cp or 0)
+                        
+                        best_engine_move = chess.Move.from_uci(engine_result["bestmove"])
+                        node.engine_moves.append(EngineMove(move=best_engine_move, eval=eval_score))
+                except Exception:
+                    # If engine analysis fails, continue without it
+                    pass
+            
+            solution_nodes.append(node)
+            board_copy.push(move)
+        
+        # Get final board state after all moves
+        final_board = board_copy
+    else:
+        solution_moves = []
+        final_board = start_board.copy()
+    
+    # Detect themes
+    themes = []
+    if solution_moves:
+        themes = detect_themes(start_board, solution_moves, final_board)
+    
+    # Calculate v2 difficulty rating
+    difficulty_v2 = difficulty_rating  # Default to v1 if we can't compute v2
+    if solution_nodes:
+        try:
+            difficulty_v2 = calculate_difficulty_rating_v2(
+                mate_in, tree, start_board, game, solution_nodes
+            )
+        except Exception:
+            # Fall back to v1 rating if v2 calculation fails
+            pass
+    
+    # Calculate material sacrifice value
+    material_sacrifice_value = 0
+    if solution_moves:
+        def material_value(board):
+            val = 0
+            for p in board.piece_map().values():
+                piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+                              chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+                val += piece_values.get(p.piece_type, 0)
+            return val
+        
+        board_before = start_board.copy()
+        initial_mat = material_value(board_before)
+        board_before.push(solution_moves[0])
+        after_mat = material_value(board_before)
+        material_sacrifice_value = max(0, initial_mat - after_mat)
+    
+    # Calculate average attacker branching
+    avg_att_branch = 1.0
+    attacker_nodes = [n for n in solution_nodes if n.to_move == "attacker"]
+    if attacker_nodes:
+        total_checks = sum(len(n.checking_moves) for n in attacker_nodes)
+        avg_att_branch = total_checks / len(attacker_nodes) if attacker_nodes else 1.0
+    
+    # Calculate fun score
+    fun_score = calculate_fun_score(
+        themes, material_sacrifice_value, mate_in, avg_att_branch
     )
     
     rec = {
@@ -368,6 +729,9 @@ def make_record(game, pid, start_board, mate_in, solutionSAN, solutionUCI=None, 
         "whitePocket": w_poc, 
         "blackPocket": b_poc,
         "difficultyRating": difficulty_rating,
+        "difficulty_v2": difficulty_v2,
+        "themes": themes,
+        "fun_score": fun_score,
         "tags": ["alwaysCheck","dropOK","fromGame","forced","fullChecks"],
         "whiteElo": game.headers.get("WhiteElo"),
         "blackElo": game.headers.get("BlackElo"),
@@ -551,7 +915,7 @@ def main(argv=None):
     prev_f = None
     if args.preview_csv:
         prev_f = open(args.preview_csv, "w", encoding="utf-8")
-        prev_f.write("id,fenStart,sideToMove,mateIn,difficultyRating,whiteElo,blackElo,site\n")
+        prev_f.write("id,fenStart,sideToMove,mateIn,difficultyRating,difficulty_v2,fun_score,themes,whiteElo,blackElo,site\n")
 
     tree = SearchTree()
     total_games = 0
@@ -601,6 +965,7 @@ def main(argv=None):
                     solutionSAN=solutionSAN,
                     solutionUCI=solutionUCI,
                     tree=None,  # Tree not needed for basic puzzle usage
+                    engine=eng,  # Pass engine for enhanced analysis
                 )
                 game_candidates.append(rec)
 
@@ -626,9 +991,13 @@ def main(argv=None):
     if prev_f:
         for rec in all_puzzles:
             start_fen = rec["fenStart"]
+            themes_str = ";".join(rec.get("themes", []))
             prev_f.write(
                 f"{rec['id']},{start_fen},{rec['sideToMove']},"
                 f"{rec['mateIn']},{rec['difficultyRating']},"
+                f"{rec.get('difficulty_v2', rec['difficultyRating'])},"
+                f"{rec.get('fun_score', 0):.2f},"
+                f"\"{themes_str}\","
                 f"{rec.get('whiteElo', '')},"
                 f"{rec.get('blackElo', '')},"
                 f"{rec.get('site', '')}\n"
