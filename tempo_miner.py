@@ -131,7 +131,7 @@ class Engine:
             if token in line:
                 return
 
-    def analyze_fen(self, fen: str, nodes: int = 2000) -> Dict[str, Any]:
+    def analyze_fen(self, fen: str, nodes: int = 2000, depth: int = 0, mate_in: int = 0) -> Dict[str, Any]:
         """
         Run a single search from FEN, return:
           {
@@ -140,10 +140,23 @@ class Engine:
             "mate": <int or None>,
             "pv": ["e2e4", "e7e5", ...]
           }
+        
+        Args:
+            fen: Position to analyze
+            nodes: Node count limit (used if depth and mate_in are 0)
+            depth: Search depth limit (takes precedence over nodes if > 0)
+            mate_in: Search for mate in X moves using "go mate X" (takes precedence over depth)
         """
         self._send("ucinewgame")
         self._send(f"position fen {fen}")
-        self._send(f"go nodes {nodes}")
+        
+        # Choose search mode: mate > depth > nodes
+        if mate_in > 0:
+            self._send(f"go mate {mate_in}")
+        elif depth > 0:
+            self._send(f"go depth {depth}")
+        else:
+            self._send(f"go nodes {nodes}")
 
         bestmove = None
         score_cp = None
@@ -759,12 +772,25 @@ def extract_always_check_sequence(game: chess.pgn.Game,
                                   max_mate_in: int,
                                   max_nodes: int,
                                   tail_plies: int,
-                                  tree: SearchTree) -> Optional[Tuple[chess.Board, int, List[str], List[str]]]:
+                                  tree: SearchTree,
+                                  search_depth: int = 0,
+                                  verify_optimal: bool = False) -> Optional[Tuple[chess.Board, int, List[str], List[str]]]:
     """
     Look at game from ply `start_ply` onward. Try to find:
       - a sequence where attacking side gives check on every move (Tempo rule),
       - verified by engine as mating within `max_mate_in` plies,
       - bounded by `tail_plies` from game end.
+
+    Args:
+        game: The chess game to analyze
+        engine: Engine instance for analysis
+        start_ply: Ply to start searching from
+        max_mate_in: Maximum mate depth to consider
+        max_nodes: Node count for initial search (used if search_depth=0)
+        tail_plies: Only search within this many plies of game end
+        tree: SearchTree for storing analysis
+        search_depth: If > 0, use depth-based search instead of node-based
+        verify_optimal: If True, do a second deep search to verify we have the shortest mate
 
     Returns (start_board, mate_in, solutionSAN, solutionUCI) or None.
     """
@@ -782,7 +808,13 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     # Now start from this position and see if engine finds a mating always-check line
     # board.fen() for Crazyhouse includes pocket notation [QPnb] automatically
     fen0 = board.fen()
-    engine_info = engine.analyze_fen(fen0, nodes=max_nodes)
+    
+    # Use depth-based search if specified, otherwise fall back to nodes
+    if search_depth > 0:
+        engine_info = engine.analyze_fen(fen0, depth=search_depth)
+    else:
+        engine_info = engine.analyze_fen(fen0, nodes=max_nodes)
+    
     best = engine_info["bestmove"]
     mate = engine_info["mate"]
 
@@ -792,6 +824,15 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     # We only care about forced mates within max_mate_in
     if abs(mate) > max_mate_in:
         return None
+    
+    # If verify_optimal is enabled, do a deeper search with "go mate" to find shortest mate
+    if verify_optimal and mate is not None:
+        # Search specifically for optimal mate
+        verify_info = engine.analyze_fen(fen0, mate_in=abs(mate))
+        if verify_info["mate"] is not None and abs(verify_info["mate"]) < abs(mate):
+            # Found a shorter mate!
+            engine_info = verify_info
+            mate = verify_info["mate"]
 
     # Build the PV as a sequence of UCI moves
     pv_uci = engine_info["pv"]
@@ -884,8 +925,12 @@ def parse_args(argv=None):
                     help="Alternate engine path used to verify sequences")
     ap.add_argument("--max-mate-in", dest="max_mate_in", type=int, default=9,
                     help="Maximum mate-in plies allowed for a puzzle (abs(mate) <= this)")
-    ap.add_argument("--max-nodes", dest="max_nodes", type=int, default=3000,
-                    help="Max engine nodes per search")
+    ap.add_argument("--max-nodes", dest="max_nodes", type=int, default=50000,
+                    help="Max engine nodes per search (default: 50000, use higher for more accurate mate finding)")
+    ap.add_argument("--search-depth", dest="search_depth", type=int, default=0,
+                    help="Use depth-based search instead of node-based (0 = use nodes, recommended: 20-30 for accurate mates)")
+    ap.add_argument("--verify-optimal", dest="verify_optimal", action="store_true",
+                    help="Do a second deep search with 'go mate' to verify we have the shortest mate (slower but more accurate)")
     ap.add_argument("--tail-plies", dest="tail_plies", type=int, default=16,
                     help="Only look for puzzles within this many plies of game end (0 = whole game).")
     ap.add_argument("--progress-every-games", dest="progress_every_games", type=int, default=10,
@@ -907,8 +952,10 @@ def main(argv=None):
         print(f"Engine not found: {engine_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Set up engine
-    engine_cfg = EngineConfig(path=engine_path, timeout_sec=2.0)
+    # Set up engine with longer timeout for deeper searches
+    # Increase timeout if using depth-based search or verify_optimal
+    timeout = 5.0 if (args.search_depth > 0 or args.verify_optimal) else 2.0
+    engine_cfg = EngineConfig(path=engine_path, timeout_sec=timeout)
 
     # Prepare outputs
     out_f = open(args.output_jsonl, "w", encoding="utf-8")
@@ -949,6 +996,8 @@ def main(argv=None):
                     max_nodes=args.max_nodes,
                     tail_plies=args.tail_plies,
                     tree=tree,
+                    search_depth=args.search_depth,
+                    verify_optimal=args.verify_optimal,
                 )
                 if result is None:
                     continue
