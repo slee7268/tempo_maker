@@ -202,6 +202,99 @@ class Engine:
             "pv": pv,
         }
 
+    def analyze_fen_multipv(self, fen: str, num_pvs: int = 5, depth: int = 20) -> List[Dict[str, Any]]:
+        """
+        Run a multi-PV search to get multiple candidate lines.
+        
+        This is essential for finding tempo-compliant mates: the engine's #1 choice
+        might not satisfy the "always check" rule, but line #2 or #3 might.
+        
+        Args:
+            fen: Position to analyze
+            num_pvs: Number of principal variations to search (default: 5)
+            depth: Search depth (default: 20)
+        
+        Returns:
+            List of {bestmove, score_cp, mate, pv} dicts ordered by engine preference
+        """
+        self._send("ucinewgame")
+        self._send(f"setoption name MultiPV value {num_pvs}")
+        self._send("isready")
+        self._wait_for("readyok")
+        self._send(f"position fen {fen}")
+        self._send(f"go depth {depth}")
+
+        # Collect info lines per PV - store the latest (deepest) result for each PV
+        pv_results: Dict[int, Dict[str, Any]] = {}
+
+        while True:
+            line = self._read_line(self.timeout_sec)
+            if line is None:
+                break
+            line = line.strip()
+            
+            if line.startswith("info "):
+                tokens = line.split()
+                
+                # Skip lines without depth info (they're usually incomplete)
+                if "depth" not in tokens:
+                    continue
+                
+                # Get multipv index (1-based), default to 1 if not present
+                pv_idx = 1
+                if "multipv" in tokens:
+                    idx = tokens.index("multipv")
+                    if idx + 1 < len(tokens):
+                        try:
+                            pv_idx = int(tokens[idx + 1])
+                        except:
+                            pass
+                
+                # Parse score
+                score_cp = None
+                mate = None
+                if "score" in tokens:
+                    idx = tokens.index("score")
+                    if idx + 2 < len(tokens):
+                        kind = tokens[idx + 1]
+                        val = tokens[idx + 2]
+                        if kind == "cp":
+                            try:
+                                score_cp = int(val)
+                            except:
+                                pass
+                        elif kind == "mate":
+                            try:
+                                mate = int(val)
+                            except:
+                                pass
+                
+                # Parse PV
+                pv = []
+                if "pv" in tokens:
+                    idx = tokens.index("pv")
+                    pv = tokens[idx + 1:]
+                
+                # Store/update this PV (later depth updates overwrite earlier)
+                if pv:  # Only store if we have a PV
+                    pv_results[pv_idx] = {
+                        "score_cp": score_cp,
+                        "mate": mate,
+                        "pv": pv,
+                        "bestmove": pv[0] if pv else None,
+                    }
+                    
+            elif line.startswith("bestmove"):
+                break
+
+        # Reset MultiPV to 1 for future single-line searches
+        self._send("setoption name MultiPV value 1")
+        self._send("isready")
+        self._wait_for("readyok")
+
+        # Return sorted by PV index (best first)
+        return [pv_results[i] for i in sorted(pv_results.keys()) if i in pv_results]
+
 
 # -------------------- Tree Structures --------------------
 
@@ -766,6 +859,76 @@ def make_puzzle_id(game, start_ply, puzzle_counter):
         game_id = site
     return f"{game_id}_ply{start_ply}_p{puzzle_counter}"
 
+
+def validate_tempo_sequence(board: chess.Board, pv_uci: List[str]) -> Optional[Tuple[int, List[str], List[str]]]:
+    """
+    Check if a PV satisfies the Tempo rule (every attacker move gives check).
+    
+    This is the core validation function used by Multi-PV search to find
+    tempo-compliant mate sequences even when the engine's best line doesn't
+    satisfy the tempo rule.
+    
+    Args:
+        board: Starting board position (will not be modified)
+        pv_uci: List of UCI move strings from engine PV
+    
+    Returns:
+        (mate_in, solutionSAN, solutionUCI) tuple if valid, or None if tempo rule violated
+    """
+    if not pv_uci:
+        return None
+    
+    tmp = board.copy(stack=False)
+    solutionSAN: List[str] = []
+    solutionUCI: List[str] = []
+    attacker_turn = tmp.turn  # Remember who is the attacking side
+    
+    for i, u in enumerate(pv_uci):
+        try:
+            move = chess.Move.from_uci(u)
+        except ValueError:
+            break
+            
+        if move not in tmp.legal_moves:
+            break
+            
+        san = tmp.san(move)
+        is_attacker_move = (tmp.turn == attacker_turn)
+        
+        # Push the move to see if it results in check
+        tmp.push(move)
+        
+        # If this is an attacker move, it MUST result in check (tempo rule)
+        if is_attacker_move and not tmp.is_check():
+            return None  # Violates tempo rule
+        
+        solutionSAN.append(san)
+        solutionUCI.append(u)
+        
+        if tmp.is_game_over():
+            break
+    
+    if not solutionSAN:
+        return None
+    
+    # Count only attacker moves for mate-in calculation
+    # Attacker moves are at indices 0, 2, 4, ...
+    attacker_move_count = (len(solutionSAN) + 1) // 2
+    mate_in = attacker_move_count
+    
+    # Verify first move gives check
+    test_board = board.copy(stack=False)
+    first_move = chess.Move.from_uci(solutionUCI[0])
+    if not is_checking_move(test_board, first_move):
+        return None
+    
+    # Verify the sequence ends in checkmate
+    if not tmp.is_checkmate():
+        return None
+    
+    return mate_in, solutionSAN, solutionUCI
+
+
 def extract_always_check_sequence(game: chess.pgn.Game,
                                   engine: Engine,
                                   start_ply: int,
@@ -774,7 +937,8 @@ def extract_always_check_sequence(game: chess.pgn.Game,
                                   tail_plies: int,
                                   tree: SearchTree,
                                   search_depth: int = 0,
-                                  verify_optimal: bool = False) -> Optional[Tuple[chess.Board, int, List[str], List[str]]]:
+                                  verify_optimal: bool = False,
+                                  multi_pv: int = 1) -> Optional[Tuple[chess.Board, int, List[str], List[str]]]:
     """
     Look at game from ply `start_ply` onward. Try to find:
       - a sequence where attacking side gives check on every move (Tempo rule),
@@ -786,11 +950,13 @@ def extract_always_check_sequence(game: chess.pgn.Game,
         engine: Engine instance for analysis
         start_ply: Ply to start searching from
         max_mate_in: Maximum mate depth to consider
-        max_nodes: Node count for initial search (used if search_depth=0)
+        max_nodes: Node count for initial search (used if search_depth=0 and multi_pv=1)
         tail_plies: Only search within this many plies of game end
         tree: SearchTree for storing analysis
         search_depth: If > 0, use depth-based search instead of node-based
         verify_optimal: If True, do a second deep search to verify we have the shortest mate
+        multi_pv: Number of PV lines to search (default 1). Higher values increase
+                  sensitivity for finding tempo-compliant mates when best line fails.
 
     Returns (start_board, mate_in, solutionSAN, solutionUCI) or None.
     """
@@ -809,6 +975,38 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     # board.fen() for Crazyhouse includes pocket notation [QPnb] automatically
     fen0 = board.fen()
     
+    # Multi-PV mode: search multiple lines and pick the best tempo-compliant one
+    if multi_pv > 1:
+        depth = search_depth if search_depth > 0 else 20  # Default depth for multi-pv
+        pv_results = engine.analyze_fen_multipv(fen0, num_pvs=multi_pv, depth=depth)
+        
+        # Try each PV in order of engine preference
+        # Pick the SHORTEST tempo-compliant mate
+        best_result: Optional[Tuple[int, List[str], List[str]]] = None
+        
+        for pv_info in pv_results:
+            mate = pv_info.get("mate")
+            pv_uci = pv_info.get("pv", [])
+            
+            # Skip if not a mate or mate too deep
+            if mate is None or abs(mate) > max_mate_in:
+                continue
+            
+            # Validate tempo compliance
+            result = validate_tempo_sequence(board, pv_uci)
+            if result is not None:
+                mate_in, solutionSAN, solutionUCI = result
+                # Accept this if it's the first valid one or shorter than previous
+                if best_result is None or mate_in < best_result[0]:
+                    best_result = result
+        
+        if best_result is not None:
+            mate_in, solutionSAN, solutionUCI = best_result
+            return board, mate_in, solutionSAN, solutionUCI
+        
+        return None
+    
+    # Single-PV mode (original behavior)
     # Use depth-based search if specified, otherwise fall back to nodes
     if search_depth > 0:
         engine_info = engine.analyze_fen(fen0, depth=search_depth)
@@ -839,63 +1037,12 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     if not pv_uci:
         return None
 
-    # Convert PV to SAN, enforce "always check"
-    # CRITICAL: Attacker moves are at indices 0, 2, 4, ... (every other move starting from 0)
-    # Defender moves are at indices 1, 3, 5, ...
-    # We need EVERY attacker move to give check (including the final checkmate)
-    tmp = board.copy(stack=False)
-    solutionSAN: List[str] = []
-    solutionUCI: List[str] = []
-    attacker_turn = tmp.turn  # Remember who is the attacking side
-
-    for i, u in enumerate(pv_uci):
-        move = chess.Move.from_uci(u)
-        if move not in tmp.legal_moves:
-            break
-        san = tmp.san(move)
-        
-        is_attacker_move = (tmp.turn == attacker_turn)
-        
-        # Push the move to see if it results in check
-        tmp.push(move)
-        
-        # If this is an attacker move, it MUST result in check
-        if is_attacker_move and not tmp.is_check():
-            # Violates always-check rule
-            return None
-
-        solutionSAN.append(san)
-        solutionUCI.append(u)
-
-        if tmp.is_game_over():
-            break
-
-    if not solutionSAN:
+    # Use the helper function to validate tempo compliance
+    result = validate_tempo_sequence(board, pv_uci)
+    if result is None:
         return None
-
-    # Count only attacker moves for mate-in calculation
-    # Attacker moves are at indices 0, 2, 4, ...
-    attacker_move_count = (len(solutionSAN) + 1) // 2
-    mate_in = attacker_move_count
-
-    # Verify first move is by attacker and gives check
-    test_board = board.copy(stack=False)
-    first_move = chess.Move.from_uci(solutionUCI[0])
-    if not is_checking_move(test_board, first_move):
-        return None
-
-    # Optional: record tree info (attacker moves, etc.)
-    # COMMENTED OUT: Tree is not needed for basic puzzle usage
-    # node0 = tree.get_or_create(fen0)
-    # node0.attacker_moves.append(
-    #     MoveInfo(
-    #         uci=solutionUCI[0],
-    #         san=solutionSAN[0],
-    #         mate=mate,
-    #         klass="force",
-    #     )
-    # )
-
+    
+    mate_in, solutionSAN, solutionUCI = result
     return board, mate_in, solutionSAN, solutionUCI
 
 
@@ -931,6 +1078,8 @@ def parse_args(argv=None):
                     help="Use depth-based search instead of node-based (0 = use nodes, recommended: 20-30 for accurate mates)")
     ap.add_argument("--verify-optimal", dest="verify_optimal", action="store_true",
                     help="Do a second deep search with 'go mate' to verify we have the shortest mate (slower but more accurate)")
+    ap.add_argument("--multi-pv", dest="multi_pv", type=int, default=1,
+                    help="Number of principal variations to search (default: 1). Use 5-10 to find tempo-compliant mates when engine's best line fails the tempo rule. Slower but increases puzzle discovery sensitivity.")
     ap.add_argument("--tail-plies", dest="tail_plies", type=int, default=16,
                     help="Only look for puzzles within this many plies of game end (0 = whole game).")
     ap.add_argument("--progress-every-games", dest="progress_every_games", type=int, default=10,
@@ -953,8 +1102,13 @@ def main(argv=None):
         sys.exit(1)
 
     # Set up engine with longer timeout for deeper searches
-    # Increase timeout if using depth-based search or verify_optimal
-    timeout = 5.0 if (args.search_depth > 0 or args.verify_optimal) else 2.0
+    # Increase timeout if using depth-based search, verify_optimal, or multi-pv
+    if args.multi_pv > 1:
+        timeout = 10.0  # Multi-PV needs more time
+    elif args.search_depth > 0 or args.verify_optimal:
+        timeout = 5.0
+    else:
+        timeout = 2.0
     engine_cfg = EngineConfig(path=engine_path, timeout_sec=timeout)
 
     # Prepare outputs
@@ -998,6 +1152,7 @@ def main(argv=None):
                     tree=tree,
                     search_depth=args.search_depth,
                     verify_optimal=args.verify_optimal,
+                    multi_pv=args.multi_pv,
                 )
                 if result is None:
                     continue
