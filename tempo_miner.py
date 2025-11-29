@@ -860,7 +860,7 @@ def make_puzzle_id(game, start_ply, puzzle_counter):
     return f"{game_id}_ply{start_ply}_p{puzzle_counter}"
 
 
-def validate_tempo_sequence(board: chess.Board, pv_uci: List[str]) -> Optional[Tuple[int, List[str], List[str]]]:
+def validate_tempo_sequence(board: chess.Board, pv_uci: List[str], engine: Optional['Engine'] = None) -> Optional[Tuple[int, List[str], List[str]]]:
     """
     Check if a PV satisfies the Tempo rule (every attacker move gives check).
     
@@ -868,9 +868,13 @@ def validate_tempo_sequence(board: chess.Board, pv_uci: List[str]) -> Optional[T
     tempo-compliant mate sequences even when the engine's best line doesn't
     satisfy the tempo rule.
     
+    If the PV doesn't end in checkmate but the position is winning, we attempt
+    to extend the sequence by finding forcing continuations.
+    
     Args:
         board: Starting board position (will not be modified)
         pv_uci: List of UCI move strings from engine PV
+        engine: Optional engine instance for extending incomplete PVs
     
     Returns:
         (mate_in, solutionSAN, solutionUCI) tuple if valid, or None if tempo rule violated
@@ -883,6 +887,7 @@ def validate_tempo_sequence(board: chess.Board, pv_uci: List[str]) -> Optional[T
     solutionUCI: List[str] = []
     attacker_turn = tmp.turn  # Remember who is the attacking side
     
+    # Phase 1: Process the engine's PV
     for i, u in enumerate(pv_uci):
         try:
             move = chess.Move.from_uci(u)
@@ -905,25 +910,109 @@ def validate_tempo_sequence(board: chess.Board, pv_uci: List[str]) -> Optional[T
         solutionSAN.append(san)
         solutionUCI.append(u)
         
-        if tmp.is_game_over():
+        if tmp.is_checkmate():
             break
     
     if not solutionSAN:
         return None
     
+    # Phase 2: Extend if PV is incomplete (doesn't end in checkmate)
+    # This handles cases where the engine truncates the PV
+    max_extension_moves = 20  # Safety limit to prevent infinite loops
+    extension_count = 0
+    
+    while not tmp.is_checkmate() and not tmp.is_stalemate() and extension_count < max_extension_moves:
+        extension_count += 1
+        is_attacker_move = (tmp.turn == attacker_turn)
+        
+        if tmp.is_game_over():
+            break
+        
+        if is_attacker_move:
+            # Attacker's turn: must find a checking move
+            checking_moves = [m for m in tmp.legal_moves if is_checking_move(tmp, m)]
+            
+            if not checking_moves:
+                # No checking moves available - can't complete the tempo sequence
+                return None
+            
+            # Prefer immediate checkmate if available
+            best_move = None
+            for cm in checking_moves:
+                test_board = tmp.copy(stack=False)
+                test_board.push(cm)
+                if test_board.is_checkmate():
+                    best_move = cm
+                    break
+            
+            # If no immediate mate, use engine to find best checking move
+            if best_move is None and engine is not None:
+                try:
+                    result = engine.analyze_fen(tmp.fen(), nodes=10000)
+                    if result.get("bestmove"):
+                        candidate = chess.Move.from_uci(result["bestmove"])
+                        if candidate in checking_moves:
+                            best_move = candidate
+                except Exception:
+                    pass
+            
+            # Fall back to first checking move
+            if best_move is None:
+                best_move = checking_moves[0]
+            
+            san = tmp.san(best_move)
+            tmp.push(best_move)
+            solutionSAN.append(san)
+            solutionUCI.append(best_move.uci())
+            
+        else:
+            # Defender's turn: find best defense
+            legal_moves = list(tmp.legal_moves)
+            
+            if not legal_moves:
+                # No legal moves after check = checkmate already (shouldn't reach here)
+                break
+            
+            # Use engine to find best defense if available
+            best_defense = None
+            if engine is not None:
+                try:
+                    result = engine.analyze_fen(tmp.fen(), nodes=5000)
+                    if result.get("bestmove"):
+                        candidate = chess.Move.from_uci(result["bestmove"])
+                        if candidate in legal_moves:
+                            best_defense = candidate
+                except Exception:
+                    pass
+            
+            # Fall back to first legal move
+            if best_defense is None:
+                best_defense = legal_moves[0]
+            
+            san = tmp.san(best_defense)
+            tmp.push(best_defense)
+            solutionSAN.append(san)
+            solutionUCI.append(best_defense.uci())
+    
+    # Final validation: must end in checkmate
+    if not tmp.is_checkmate():
+        return None
+    
+    # Verify the solution ends on an attacker move (the mating move)
+    num_moves = len(solutionSAN)
+    if num_moves % 2 == 0:
+        # Even number of moves means last move was defender - something is wrong
+        return None
+    
     # Count only attacker moves for mate-in calculation
-    # Attacker moves are at indices 0, 2, 4, ...
+    # Attacker moves are at indices 0, 2, 4, ... (odd positions in 1-indexed)
     attacker_move_count = (len(solutionSAN) + 1) // 2
     mate_in = attacker_move_count
     
-    # Verify first move gives check
+    # Verify first move gives check (sanity check)
     test_board = board.copy(stack=False)
     first_move = chess.Move.from_uci(solutionUCI[0])
     if not is_checking_move(test_board, first_move):
-        return None
-    
-    # Verify the sequence ends in checkmate
-    if not tmp.is_checkmate():
         return None
     
     return mate_in, solutionSAN, solutionUCI
@@ -992,13 +1081,15 @@ def extract_always_check_sequence(game: chess.pgn.Game,
             if mate is None or abs(mate) > max_mate_in:
                 continue
             
-            # Validate tempo compliance
-            result = validate_tempo_sequence(board, pv_uci)
+            # Validate tempo compliance - pass engine for PV extension
+            result = validate_tempo_sequence(board, pv_uci, engine=engine)
             if result is not None:
                 mate_in, solutionSAN, solutionUCI = result
-                # Accept this if it's the first valid one or shorter than previous
-                if best_result is None or mate_in < best_result[0]:
-                    best_result = result
+                # Check mate_in is still within bounds after potential extension
+                if mate_in <= max_mate_in:
+                    # Accept this if it's the first valid one or shorter than previous
+                    if best_result is None or mate_in < best_result[0]:
+                        best_result = result
         
         if best_result is not None:
             mate_in, solutionSAN, solutionUCI = best_result
@@ -1037,12 +1128,17 @@ def extract_always_check_sequence(game: chess.pgn.Game,
     if not pv_uci:
         return None
 
-    # Use the helper function to validate tempo compliance
-    result = validate_tempo_sequence(board, pv_uci)
+    # Use the helper function to validate tempo compliance - pass engine for PV extension
+    result = validate_tempo_sequence(board, pv_uci, engine=engine)
     if result is None:
         return None
     
     mate_in, solutionSAN, solutionUCI = result
+    
+    # Verify mate_in is still within bounds after potential extension
+    if mate_in > max_mate_in:
+        return None
+    
     return board, mate_in, solutionSAN, solutionUCI
 
 
